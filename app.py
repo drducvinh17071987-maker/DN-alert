@@ -1,14 +1,13 @@
-# app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="DN Alerts – HRV / SpO2 / RR (50×1min)", layout="wide")
+st.set_page_config(page_title="DN Alerts – HRV / SpO₂ / RR", layout="wide")
 
 # -----------------------------
-# Utils
+# Helpers
 # -----------------------------
 def parse_series(text: str):
     if not text or not text.strip():
@@ -36,83 +35,114 @@ def make_time_index(n=50):
     start = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=n-1)
     return [start + timedelta(minutes=i) for i in range(n)]
 
-# -----------------------------
-# SpO2 fixed physiological weight (ceiling compensation)
-# -----------------------------
-def w_spo2(v):
-    if v >= 97: return 0.3
-    if v >= 95: return 0.6
-    if v >= 92: return 1.0
-    return 1.7
+def demo_series(signal="HRV", n=50, seed=7):
+    rng = np.random.default_rng(seed)
+    if signal == "HRV":
+        base = 38 + rng.normal(0, 1.2, n).cumsum() * 0.05
+        base = np.clip(base, 10, 160)
+        base[18] += 14; base[19] -= 12
+        base[34:40] -= np.linspace(0, 10, 6)
+        return base.tolist()
+    if signal == "SpO₂":
+        base = 97 + rng.normal(0, 0.25, n)
+        base[12] = 92; base[13] = 97   # drop + rebound (false alarm-like)
+        base[32:50] -= np.linspace(0, 7, 18)
+        return np.clip(base, 82, 100).tolist()
+    if signal == "RR":
+        base = 16 + rng.normal(0, 0.35, n)
+        base[20:28] += np.linspace(0, 6, 8)
+        base[28:35] += 4
+        return np.clip(base, 8, 40).tolist()
+    return rng.normal(0, 1, n).tolist()
 
 # -----------------------------
-# DN engine (single-signal)
+# Config: “chuẩn cảnh báo” (gọn, ít tham số)
+# - HRV, SpO2: tụt (down) là xấu
+# - RR: tăng (up) là xấu
+# Logic chính: rolling total % over WINDOW + ngưỡng thô (raw)
 # -----------------------------
-def dn_engine(
-    raw,
-    signal_name="HRV",
-    K=80.0,
-    use_spo2_weight=False,
-    K_spo2=5.0,
-    warn_pct_eff=-15.0,
-    red_pct_eff=-20.0,
-    red_consecutive=3,
-    vshape_drop=-20.0,
-    vshape_recover=15.0,
-    noise_up_pct=70.0,
-    noise_abs_jump=None,
-    naive_threshold=-20.0
-):
-    """
-    Returns df with:
-      raw, pct_step, w, pct_eff, TT, E, vE, alert, tag, naive_alert
-    """
+CFG = {
+    "HRV": dict(
+        window=10,                 # 10 phút
+        warn_total=-25.0,          # tổng tụt ≤ -25% -> WARNING
+        red_total=-40.0,           # tổng tụt ≤ -40% -> RED
+        raw_warn=28.0,             # HRV thô thấp -> WARNING
+        raw_red=24.0,              # HRV thô rất thấp -> RED
+        noise_up_pct=70.0,         # step tăng quá nhanh -> noise brake
+        noise_abs_jump=60.0,       # jump ms lớn -> noise brake
+        direction="down_bad",
+        naive_step=-20.0           # naive đỏ nếu step ≤ -20%
+    ),
+    "SpO₂": dict(
+        window=10,
+        warn_total=-3.0,           # tổng tụt % theo SpO2 là nhỏ (vd 97->94 ~ -3.1%)
+        red_total=-6.0,
+        raw_warn=92.0,
+        raw_red=89.0,
+        noise_up_pct=3.0,          # SpO2 tăng step >3% thường là artefact
+        noise_abs_jump=None,
+        direction="down_bad",
+        naive_step=-2.0
+    ),
+    "RR": dict(
+        window=10,
+        warn_total=18.0,           # RR tăng tổng ≥ +18% -> WARNING
+        red_total=30.0,            # RR tăng tổng ≥ +30% -> RED
+        raw_warn=22.0,
+        raw_red=28.0,
+        noise_up_pct=80.0,
+        noise_abs_jump=None,
+        direction="up_bad",
+        naive_step=20.0            # naive đỏ nếu step ≥ +20%
+    )
+}
+
+# -----------------------------
+# DN engine (window kinetics + raw thresholds + noise brake + V-shape)
+# -----------------------------
+def dn_engine(raw, signal_name):
+    cfg = CFG[signal_name]
     x = np.array(raw, dtype=float)
     n = len(x)
     t = make_time_index(n)
 
-    pct = np.zeros(n, dtype=float)
-    pct[1:] = 100.0 * (x[1:] - x[:-1]) / np.clip(x[:-1], 1e-9, None)
+    # step %
+    pct_step = np.zeros(n, dtype=float)
+    pct_step[1:] = 100.0 * (x[1:] - x[:-1]) / np.clip(x[:-1], 1e-9, None)
 
-    if use_spo2_weight:
-        w = np.array([w_spo2(v) for v in x], dtype=float)
-        pct_eff = pct * w
-        TT = pct_eff / float(K_spo2)
+    # rolling total % over window (i - W)
+    W = int(cfg["window"])
+    total_pct = np.zeros(n, dtype=float)
+    for i in range(n):
+        j = i - W
+        if j >= 0:
+            total_pct[i] = 100.0 * (x[i] - x[j]) / np.clip(x[j], 1e-9, None)
+        else:
+            total_pct[i] = 0.0
+
+    # naive (to show “báo loạn”)
+    if cfg["direction"] == "down_bad":
+        naive_alert = (pct_step <= cfg["naive_step"])
     else:
-        w = np.ones(n, dtype=float)
-        pct_eff = pct
-        TT = pct_eff / float(K)
+        naive_alert = (pct_step >= cfg["naive_step"])
 
-    E = 1.0 - TT**2
-    vE = np.zeros(n, dtype=float)
-    vE[1:] = E[1:] - E[:-1]
-
-    # naive alert based on raw %Δ only
-    naive_alert = (pct <= naive_threshold)
-
-    # noise brake (simple)
+    # noise brake
     noise = np.zeros(n, dtype=bool)
-    noise |= (pct >= noise_up_pct)
-    if noise_abs_jump is not None:
+    noise |= (pct_step >= cfg["noise_up_pct"])
+    if cfg["noise_abs_jump"] is not None:
         abs_jump = np.zeros(n, dtype=float)
         abs_jump[1:] = np.abs(x[1:] - x[:-1])
-        noise |= (abs_jump >= float(noise_abs_jump))
+        noise |= (abs_jump >= float(cfg["noise_abs_jump"]))
 
-    # V-shape recovery on pct_eff
+    # V-shape recovery (đơn giản): 1 bước tụt mạnh + 1 bước hồi mạnh
     vshape = np.zeros(n, dtype=bool)
     for i in range(2, n):
-        if (pct_eff[i-1] <= vshape_drop) and (pct_eff[i] >= vshape_recover):
-            vshape[i] = True
-
-    # sustained deterioration on pct_eff
-    sustained = np.zeros(n, dtype=bool)
-    for i in range(n):
-        if i < red_consecutive:
-            continue
-        window = pct_eff[i-red_consecutive+1:i+1]
-        window_noise = noise[i-red_consecutive+1:i+1]
-        if np.all(window <= red_pct_eff) and (not np.any(window_noise)):
-            sustained[i] = True
+        if cfg["direction"] == "down_bad":
+            if (pct_step[i-1] <= -20.0) and (pct_step[i] >= +15.0):
+                vshape[i] = True
+        else:
+            if (pct_step[i-1] >= +20.0) and (pct_step[i] <= -15.0):
+                vshape[i] = True
 
     alert = np.array(["GREEN"] * n, dtype=object)
     tag = np.array([""] * n, dtype=object)
@@ -120,25 +150,44 @@ def dn_engine(
     for i in range(n):
         if i == 0:
             alert[i] = "GREEN"; tag[i] = "baseline"; continue
+
         if noise[i]:
             alert[i] = "INFO"; tag[i] = "noise_brake"; continue
-        if sustained[i]:
-            alert[i] = "RED"; tag[i] = f"sustained_{red_consecutive}"; continue
+
         if vshape[i]:
             alert[i] = "INFO"; tag[i] = "V_recovery"; continue
-        if pct_eff[i] <= warn_pct_eff:
-            alert[i] = "WARNING"; tag[i] = "early_drop"; continue
+
+        # raw thresholds (fast safety)
+        if cfg["direction"] == "down_bad":
+            if x[i] <= cfg["raw_red"]:
+                alert[i] = "RED"; tag[i] = "raw_low"; continue
+            if x[i] <= cfg["raw_warn"]:
+                alert[i] = "WARNING"; tag[i] = "raw_low"; continue
+        else:
+            if x[i] >= cfg["raw_red"]:
+                alert[i] = "RED"; tag[i] = "raw_high"; continue
+            if x[i] >= cfg["raw_warn"]:
+                alert[i] = "WARNING"; tag[i] = "raw_high"; continue
+
+        # kinetics (window total)
+        if cfg["direction"] == "down_bad":
+            if total_pct[i] <= cfg["red_total"]:
+                alert[i] = "RED"; tag[i] = f"total_{W}"; continue
+            if total_pct[i] <= cfg["warn_total"]:
+                alert[i] = "WARNING"; tag[i] = f"total_{W}"; continue
+        else:
+            if total_pct[i] >= cfg["red_total"]:
+                alert[i] = "RED"; tag[i] = f"total_{W}"; continue
+            if total_pct[i] >= cfg["warn_total"]:
+                alert[i] = "WARNING"; tag[i] = f"total_{W}"; continue
+
         alert[i] = "GREEN"; tag[i] = "stable"
 
     df = pd.DataFrame({
         "time": t,
         "raw": x,
-        "pct_step": pct,
-        "w": w,
-        "pct_eff": pct_eff,
-        "TT": TT,
-        "E": E,
-        "vE": vE,
+        "pct_step": pct_step,
+        "total_pct_window": total_pct,
         "alert": alert,
         "tag": tag,
         "naive_alert": naive_alert
@@ -156,17 +205,12 @@ def segments(df):
     segs.append((df.loc[start, "time"], df.loc[len(df)-1, "time"], df.loc[start, "alert"]))
     return pd.DataFrame(segs, columns=["start", "end", "alert"])
 
-# -----------------------------
-# Plotly charts
-# -----------------------------
 def add_alert_bands(fig, seg_df, y0, y1):
-    # NOTE: Plotly doesn't accept color names for opacity-free reliably across themes;
-    # we use rgba with fixed transparency.
     band_color = {
         "GREEN": "rgba(0, 200, 0, 0.10)",
         "INFO": "rgba(0, 160, 255, 0.12)",
         "WARNING": "rgba(255, 180, 0, 0.14)",
-        "RED": "rgba(255, 0, 0, 0.16)",
+        "RED": "rgba(255, 0, 0, 0.18)",
     }
     for _, r in seg_df.iterrows():
         fig.add_shape(
@@ -185,31 +229,27 @@ def plot_raw_with_dn_and_naive(df, title):
 
     y_min = float(np.min(y))
     y_max = float(np.max(y))
-    pad = (y_max - y_min) * 0.15 if y_max > y_min else 1.0
+    pad = (y_max - y_min) * 0.18 if y_max > y_min else 1.0
     y0, y1 = y_min - pad, y_max + pad
 
     fig = go.Figure()
-
-    # DN alert bands
     seg = segments(df)
     add_alert_bands(fig, seg, y0, y1)
 
-    # raw line
     fig.add_trace(go.Scatter(x=t, y=y, mode="lines+markers", name="Raw"))
 
-    # naive alerts: red markers on raw when naive_alert=True
     mask = df["naive_alert"].values.astype(bool)
     fig.add_trace(go.Scatter(
         x=t[mask],
         y=y[mask],
         mode="markers",
-        name="Naive %Δ alert (red dots)",
+        name="Naive alert (red dots)",
         marker=dict(color="red", size=10, symbol="x")
     ))
 
     fig.update_layout(
         title=title,
-        height=360,
+        height=520,
         margin=dict(l=10, r=10, t=50, b=10),
         xaxis_title="time",
         yaxis_title="raw",
@@ -218,56 +258,22 @@ def plot_raw_with_dn_and_naive(df, title):
     fig.update_yaxes(range=[y0, y1])
     return fig
 
-def plot_pct_compare(df, title, naive_threshold):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["time"], y=df["pct_step"], mode="lines+markers", name="%Δ_step (naive)"))
-    fig.add_trace(go.Scatter(x=df["time"], y=df["pct_eff"], mode="lines+markers", name="%Δ_eff (DN input)"))
-    fig.add_hline(y=naive_threshold, line_dash="dash", annotation_text=f"naive threshold {naive_threshold}")
-    fig.update_layout(
-        title=title,
-        height=320,
-        margin=dict(l=10, r=10, t=50, b=10),
-        xaxis_title="time",
-        yaxis_title="% change",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-    )
-    return fig
-
 # -----------------------------
-# Demo generators (optional)
+# UI (2 columns, no "Parameters" block)
 # -----------------------------
-def demo_series(signal="HRV", n=50, seed=7):
-    rng = np.random.default_rng(seed)
-    if signal == "HRV":
-        base = 35 + rng.normal(0, 1.2, n).cumsum() * 0.06
-        base = np.clip(base, 12, 160)
-        base[18] += 14; base[19] -= 12
-        base[34:40] -= np.linspace(0, 10, 6)
-        return base.tolist()
-    if signal == "SpO₂":
-        base = 97 + rng.normal(0, 0.2, n)
-        base[12] = 92; base[13] = 97
-        base[32:50] -= np.linspace(0, 7, 18)
-        return np.clip(base, 82, 100).tolist()
-    if signal == "RR":
-        base = 16 + rng.normal(0, 0.35, n)
-        base[20:28] += np.linspace(0, 6, 8)
-        base[28:35] += 4
-        return np.clip(base, 8, 40).tolist()
-    return rng.normal(0, 1, n).tolist()
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("DN Alerts – HRV / SpO₂ / RR • 50 points • 1-min sampling")
-st.caption("Bấm Run để tính. Đồ thị 1: Raw + DN band + chấm đỏ (naive %Δ báo loạn). Đồ thị 2: %Δ_step vs %Δ_eff.")
+st.title("DN Alerts – HRV / SpO₂ / RR (50×1min)")
+st.caption("Cột trái nhập số + Run. Cột phải hiển thị đồ thị (DN bands + naive red dots).")
 
 tabs = st.tabs(["HRV", "SpO₂", "RR"])
 
-def tab(signal):
-    st.subheader(signal)
+def render_tab(signal):
+    left, right = st.columns([1, 2], gap="large")
 
-    with st.form(key=f"form_{signal}"):
+    cfg = CFG[signal]
+
+    with left:
+        st.subheader(f"{signal} input")
+
         if signal == "HRV":
             default_text = "45 44 42 35 36 32 30 28 27 22"
         elif signal == "SpO₂":
@@ -275,134 +281,71 @@ def tab(signal):
         else:
             default_text = "16 16 17 18 20 22 24 24 23 22"
 
-        text = st.text_area("Paste values (50 numbers preferred)", value=default_text, height=110)
-        c1, c2, c3 = st.columns(3)
+        text = st.text_area("Paste values (space-separated)", value=default_text, height=120)
+
+        c1, c2 = st.columns(2)
         with c1:
             use_demo = st.checkbox("Use demo 50 points", value=False)
         with c2:
             seed = st.number_input("Demo seed", 0, 9999, 7, 1)
-        with c3:
-            run = st.form_submit_button("Run")
+
+        run = st.button("Run", type="primary")
+
+        st.markdown("**Current alert rules (fixed):**")
+        if cfg["direction"] == "down_bad":
+            st.write(f"- **RED** if raw ≤ {cfg['raw_red']} OR total({cfg['window']}m) ≤ {cfg['red_total']}%")
+            st.write(f"- **WARNING** if raw ≤ {cfg['raw_warn']} OR total({cfg['window']}m) ≤ {cfg['warn_total']}%")
+        else:
+            st.write(f"- **RED** if raw ≥ {cfg['raw_red']} OR total({cfg['window']}m) ≥ {cfg['red_total']}%")
+            st.write(f"- **WARNING** if raw ≥ {cfg['raw_warn']} OR total({cfg['window']}m) ≥ {cfg['warn_total']}%")
+        st.write(f"- **INFO** noise_brake if step% ≥ {cfg['noise_up_pct']} (or big jump), or V-recovery")
+        st.write(f"- **Naive red dots**: step% threshold = {cfg['naive_step']} ({'≤' if cfg['direction']=='down_bad' else '≥'})")
 
     if not run:
-        st.info("Dán dữ liệu rồi bấm **Run**.")
-        st.stop()
+        with right:
+            st.info("Nhập dữ liệu rồi bấm **Run**.")
+        return
 
-    # series
+    # build series
     if use_demo:
         raw = demo_series(signal, 50, int(seed))
     else:
         raw = normalize_len(parse_series(text), 50)
 
     if len(raw) == 0:
-        st.error("Không đọc được số nào. Bạn dán lại chuỗi số (cách nhau bởi space/comma).")
-        st.stop()
+        with right:
+            st.error("Không đọc được số nào. Bạn dán lại chuỗi số (cách nhau bởi space/comma).")
+        return
 
-    st.markdown("### Parameters")
+    df = dn_engine(raw, signal)
 
-    if signal == "HRV":
-        a1, a2, a3, a4 = st.columns(4)
-        with a1: K = st.number_input("K (HRV)", value=80.0, step=1.0)
-        with a2: warn = st.number_input("WARNING if pct_eff ≤", value=-15.0, step=1.0)
-        with a3: red = st.number_input("RED if pct_eff ≤", value=-20.0, step=1.0)
-        with a4: consec = st.slider("RED consecutive steps", 2, 6, 3)
-
-        b1, b2, b3, b4 = st.columns(4)
-        with b1: vdrop = st.number_input("V-shape drop", value=-20.0, step=1.0)
-        with b2: vrec = st.number_input("V-shape recover", value=15.0, step=1.0)
-        with b3: noise_up = st.number_input("Noise-brake if pct_step ≥", value=70.0, step=5.0)
-        with b4: noise_abs = st.number_input("Noise abs jump (ms) ≥", value=60.0, step=5.0)
-
-        naive_thr = st.number_input("Naive %Δ threshold (red dots if %Δ ≤)", value=-20.0, step=1.0)
-
-        df = dn_engine(
-            raw, "HRV",
-            K=K,
-            use_spo2_weight=False,
-            warn_pct_eff=warn, red_pct_eff=red, red_consecutive=consec,
-            vshape_drop=vdrop, vshape_recover=vrec,
-            noise_up_pct=noise_up, noise_abs_jump=noise_abs,
-            naive_threshold=naive_thr
-        )
-
-    elif signal == "SpO₂":
-        a1, a2, a3, a4 = st.columns(4)
-        with a1: Kspo2 = st.number_input("Kspo2 (TT = pct_eff/Kspo2)", value=5.0, step=0.5)
-        with a2: warn = st.number_input("WARNING if pct_eff ≤", value=-1.2, step=0.1)
-        with a3: red = st.number_input("RED if pct_eff ≤", value=-1.8, step=0.1)
-        with a4: consec = st.slider("RED consecutive steps", 2, 6, 3)
-
-        b1, b2, b3 = st.columns(3)
-        with b1: vdrop = st.number_input("V-shape drop", value=-1.0, step=0.1)
-        with b2: vrec = st.number_input("V-shape recover", value=1.0, step=0.1)
-        with b3: noise_up = st.number_input("Noise-brake if pct_step ≥", value=3.0, step=0.5)
-
-        naive_thr = st.number_input("Naive %Δ threshold (red dots if %Δ ≤)", value=-2.0, step=0.1)
-
-        df = dn_engine(
-            raw, "SpO₂",
-            use_spo2_weight=True, K_spo2=Kspo2,
-            warn_pct_eff=warn, red_pct_eff=red, red_consecutive=consec,
-            vshape_drop=vdrop, vshape_recover=vrec,
-            noise_up_pct=noise_up, noise_abs_jump=None,
-            naive_threshold=naive_thr
-        )
-
-    else:  # RR
-        a1, a2, a3, a4 = st.columns(4)
-        with a1: K = st.number_input("K (RR)", value=40.0, step=1.0)
-        with a2: warn = st.number_input("WARNING if pct_eff ≤", value=-10.0, step=1.0)
-        with a3: red = st.number_input("RED if pct_eff ≤", value=-15.0, step=1.0)
-        with a4: consec = st.slider("RED consecutive steps", 2, 6, 3)
-
-        b1, b2, b3 = st.columns(3)
-        with b1: vdrop = st.number_input("V-shape drop", value=-10.0, step=1.0)
-        with b2: vrec = st.number_input("V-shape recover", value=8.0, step=1.0)
-        with b3: noise_up = st.number_input("Noise-brake if pct_step ≥", value=60.0, step=5.0)
-
-        naive_thr = st.number_input("Naive %Δ threshold (red dots if %Δ ≤)", value=-15.0, step=1.0)
-
-        df = dn_engine(
-            raw, "RR",
-            K=K,
-            use_spo2_weight=False,
-            warn_pct_eff=warn, red_pct_eff=red, red_consecutive=consec,
-            vshape_drop=vdrop, vshape_recover=vrec,
-            noise_up_pct=noise_up, noise_abs_jump=None,
-            naive_threshold=naive_thr
-        )
-
-    # Summary
+    # summary metrics
     counts = df["alert"].value_counts().reindex(["GREEN", "INFO", "WARNING", "RED"]).fillna(0).astype(int)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("GREEN", int(counts["GREEN"]))
-    c2.metric("INFO", int(counts["INFO"]))
-    c3.metric("WARNING", int(counts["WARNING"]))
-    c4.metric("RED", int(counts["RED"]))
+    with right:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("GREEN", int(counts["GREEN"]))
+        m2.metric("INFO", int(counts["INFO"]))
+        m3.metric("WARNING", int(counts["WARNING"]))
+        m4.metric("RED", int(counts["RED"]))
 
-    # Charts
-    st.markdown("### Chart 1: Raw + DN band + Naive red dots")
-    st.plotly_chart(plot_raw_with_dn_and_naive(df, f"{signal}: Raw + DN bands + naive red dots"), use_container_width=True)
+        st.plotly_chart(plot_raw_with_dn_and_naive(df, f"{signal}: Raw + DN bands + naive red dots"), use_container_width=True)
 
-    st.markdown("### Chart 2: %Δ_step vs %Δ_eff (DN input)")
-    st.plotly_chart(plot_pct_compare(df, f"{signal}: %Δ compare", naive_threshold=naive_thr), use_container_width=True)
-
-    # Tables
-    st.markdown("### DN Table (paper-ready)")
+    # tables (below, still gọn)
+    st.markdown("### Table")
     show = df.copy()
-    for col in ["raw", "pct_step", "w", "pct_eff", "TT", "E", "vE"]:
+    for col in ["raw", "pct_step", "total_pct_window"]:
         show[col] = show[col].astype(float).round(4)
-    st.dataframe(show, use_container_width=True, height=520)
+    st.dataframe(show, use_container_width=True, height=420)
 
-    st.markdown("### Alert segments (đoạn xanh/vàng/đỏ)")
+    st.markdown("### Segments")
     st.dataframe(segments(df), use_container_width=True)
 
     csv = show.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv, file_name=f"DN_{signal}_50points.csv", mime="text/csv")
+    st.download_button(f"Download {signal} CSV", data=csv, file_name=f"DN_{signal}_50points.csv", mime="text/csv")
 
 with tabs[0]:
-    tab("HRV")
+    render_tab("HRV")
 with tabs[1]:
-    tab("SpO₂")
+    render_tab("SpO₂")
 with tabs[2]:
-    tab("RR")
+    render_tab("RR")

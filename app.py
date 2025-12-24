@@ -1,238 +1,347 @@
 import time
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# ====== CHỐT K ======
-K_HRV = 80      # for %ΔHRV (drop)
-K_RR  = 25      # for %ΔRR (rise)  (chốt như bạn)
-K_SPO2 = 5      # for SpO2 absolute drop (points)  (chốt k=5)
+# =========================
+# Config
+# =========================
+st.set_page_config(page_title="DN alert demo", layout="wide")
+N = 15
+W = 5  # rolling window (minutes)
 
-N_POINTS = 30
-STEP_SECONDS = 3
+# Constants (your fixed K)
+K_HRV = 80.0
+K_RR  = 25.0
+K_SPO2 = 5.0
 
-# ====== CORE SETTINGS ======
-W = 6  # rolling window length (minutes) to capture "drift / sụp dần"
-# threshold for "this channel is active" in the rolling window
-THR_ACTIVE = 0.18
-# DN thresholds for color
-THR_AMBER = 0.28
-THR_RED   = 0.55
+# Step (acute) thresholds (tunable but reasonable for demo + stability)
+HRV_STEP_RED_PCT = -40.0   # %ΔHRV <= -40% => acute red
+RR_STEP_RED_PCT  = +20.0   # %ΔRR  >= +20% => acute red
+SPO2_STEP_RED_PCT = -3.0   # %ΔSpO2 <= -3% => acute red (fast drop)
+SPO2_STEP_RED_ABS = -4.0   # absolute drop <= -4 points => acute red
 
-def _rerun():
-    if hasattr(st, "rerun"):
-        st.rerun()
-    else:
-        st.experimental_rerun()
+# HRV noise-brake (v1.5 idea)
+HRV_NOISE_UP_PCT = +70.0
+HRV_NOISE_UP_ABS = +60.0   # ms
 
-def parse_series(txt: str):
-    vals = [v for v in txt.replace(",", " ").split() if v.strip() != ""]
-    return list(map(float, vals))
+# Rolling intensity thresholds (DN dynamic)
+DN_WARN = 0.35
+DN_RED  = 0.55
+HOLD_RED_POINTS = 2  # keep red for 2 points to avoid flicker
 
-def pct_change(x):
-    x = np.array(x, dtype=float)
-    pct = np.zeros(len(x))
-    for i in range(1, len(x)):
-        if x[i - 1] != 0:
-            pct[i] = 100 * (x[i] - x[i - 1]) / x[i - 1]
-    return pct
+# =========================
+# Helpers
+# =========================
+def parse_series(text: str) -> list[float]:
+    text = text.replace(",", " ").replace("\n", " ").strip()
+    if not text:
+        return []
+    vals = []
+    for tok in text.split():
+        try:
+            vals.append(float(tok))
+        except:
+            pass
+    return vals
 
-def rolling_sum(arr, w):
+def pct_change(arr: np.ndarray) -> np.ndarray:
+    # %Δ[i] = 100*(x[i]-x[i-1])/x[i-1], with first = 0
     out = np.zeros_like(arr, dtype=float)
-    for i in range(len(arr)):
-        s = max(0, i - w + 1)
-        out[i] = float(np.sum(arr[s:i+1]))
+    for i in range(1, len(arr)):
+        prev = arr[i-1]
+        if prev == 0:
+            out[i] = 0.0
+        else:
+            out[i] = 100.0 * (arr[i] - prev) / prev
     return out
 
-def dn_dynamic(hrv, rr, spo2):
+def clamp01(x):
+    return float(np.clip(x, 0.0, 1.0))
+
+def rolling_mean(x: np.ndarray, w: int) -> np.ndarray:
+    out = np.zeros_like(x, dtype=float)
+    for i in range(len(x)):
+        j0 = max(0, i - w + 1)
+        out[i] = float(np.mean(x[j0:i+1]))
+    return out
+
+def compute_dn(hrv, rr, spo2):
     """
-    DN_dynamic ICU-friendly:
-    - HRV: only DROP matters -> max(0, -%ΔHRV)/K_HRV
-    - RR: only RISE matters -> max(0, +%ΔRR)/K_RR
-    - SpO2: absolute DROP in points -> max(0, prev-curr)/K_SPO2
-    - Rolling window sum (W) to capture drift/sụp dần
-    - False-alarm filter: activate only if >=2 systems active in window
+    DN dynamic = baseline-free + multi-system gating.
+    - Convert each signal to a "badness severity" in [0,1] from step %Δ (and abs for SpO2).
+    - Step-rule catches acute events immediately.
+    - Rolling-rule (W=5) catches sustained drift and filters noise.
     """
 
     hrv = np.array(hrv, dtype=float)
-    rr = np.array(rr, dtype=float)
+    rr  = np.array(rr, dtype=float)
     spo2 = np.array(spo2, dtype=float)
 
-    # step dynamics
-    pct_hrv = pct_change(hrv)
-    pct_rr  = pct_change(rr)
+    # step %Δ
+    p_hrv  = pct_change(hrv)       # negative is bad
+    p_rr   = pct_change(rr)        # positive is bad
+    p_spo2 = pct_change(spo2)      # negative is bad
 
-    hrv_step = np.maximum(0.0, -pct_hrv) / K_HRV
-    rr_step  = np.maximum(0.0,  pct_rr)  / K_RR
+    # abs step for SpO2
+    d_spo2_abs = np.zeros_like(spo2, dtype=float)
+    d_spo2_abs[1:] = spo2[1:] - spo2[:-1]  # negative is bad
 
-    spo2_step = np.zeros(len(spo2), dtype=float)
-    for i in range(1, len(spo2)):
-        drop = max(0.0, spo2[i-1] - spo2[i])  # absolute points
-        spo2_step[i] = drop / K_SPO2
+    # Noise brake for HRV (up-spike very large)
+    noise_hrv = np.zeros(len(hrv), dtype=bool)
+    for i in range(1, len(hrv)):
+        if (p_hrv[i] >= HRV_NOISE_UP_PCT) or ((hrv[i] - hrv[i-1]) >= HRV_NOISE_UP_ABS):
+            noise_hrv[i] = True
 
-    # rolling window "drift" intensity
-    hrv_win = rolling_sum(hrv_step, W)
-    rr_win  = rolling_sum(rr_step,  W)
-    spo2_win = rolling_sum(spo2_step, W)
+    # Severity in [0,1] (how strongly "reserve is collapsing" this minute)
+    # For HRV: drop => bad => severity from (-%Δ)/K_HRV
+    sev_hrv = np.array([clamp01((-p) / K_HRV) for p in p_hrv], dtype=float)
 
-    dn = np.zeros(len(hrv), dtype=float)
+    # For RR: rise => bad => severity from (+%Δ)/K_RR
+    sev_rr = np.array([clamp01((p) / K_RR) for p in p_rr], dtype=float)
 
-    for i in range(len(hrv)):
-        active = sum([
-            hrv_win[i]  >= THR_ACTIVE,
-            rr_win[i]   >= THR_ACTIVE,
-            spo2_win[i] >= THR_ACTIVE
-        ])
+    # For SpO2: drop => bad => severity from (-%Δ)/K_SPO2, plus abs-drop support
+    sev_spo2_pct = np.array([clamp01((-p) / K_SPO2) for p in p_spo2], dtype=float)
+    sev_spo2_abs = np.array([clamp01((-(d)) / 5.0) for d in d_spo2_abs], dtype=float)  # 5-point drop => ~1
+    sev_spo2 = np.maximum(sev_spo2_pct, sev_spo2_abs)
 
-        if active >= 2:
-            dn[i] = max(hrv_win[i], rr_win[i], spo2_win[i])
+    # If HRV step looks like sensor-noise up-spike, we dampen its severity for that point
+    sev_hrv = np.where(noise_hrv, 0.0, sev_hrv)
+
+    # Step-rule flags (acute)
+    step_red_hrv  = (p_hrv <= HRV_STEP_RED_PCT) & (~noise_hrv)
+    step_red_rr   = (p_rr  >= RR_STEP_RED_PCT)
+    step_red_spo2 = (p_spo2 <= SPO2_STEP_RED_PCT) | (d_spo2_abs <= SPO2_STEP_RED_ABS)
+
+    # Multi-system gating: consider "systems in trouble" this minute
+    # system is "active" if severity >= 0.25 (light trouble)
+    active_hrv  = sev_hrv  >= 0.25
+    active_rr   = sev_rr   >= 0.25
+    active_spo2 = sev_spo2 >= 0.25
+
+    active_count = active_hrv.astype(int) + active_rr.astype(int) + active_spo2.astype(int)
+
+    # Rolling drift intensity: average of top-2 severities, but only if ≥2 systems active
+    sev_stack = np.vstack([sev_hrv, sev_rr, sev_spo2]).T  # shape (N,3)
+    top2_mean = np.array([np.mean(np.sort(row)[-2:]) for row in sev_stack], dtype=float)
+    dn_raw = np.where(active_count >= 2, top2_mean, 0.0)
+
+    # Rolling window smooth
+    dn_roll = rolling_mean(dn_raw, W)
+
+    # Classification per point
+    label = np.array(["GREEN"] * len(dn_roll), dtype=object)
+
+    # INFO: HRV noise points
+    label = np.where(noise_hrv, "INFO", label)
+
+    # WARNING / RED by rolling intensity
+    label = np.where((dn_roll >= DN_WARN) & (active_count >= 2), "WARNING", label)
+    label = np.where((dn_roll >= DN_RED)  & (active_count >= 2), "RED", label)
+
+    # Step-rule can force RED if multi-system acute, OR single-system very strong + another active
+    step_any = step_red_hrv.astype(int) + step_red_rr.astype(int) + step_red_spo2.astype(int)
+
+    # If 2+ acute flags => RED
+    label = np.where(step_any >= 2, "RED", label)
+
+    # If 1 acute flag AND at least one other system active => RED
+    label = np.where((step_any == 1) & (active_count >= 2), "RED", label)
+
+    # Hold RED for a few points to reduce flicker
+    red_hold = np.zeros(len(label), dtype=int)
+    hold = 0
+    for i in range(len(label)):
+        if label[i] == "RED":
+            hold = HOLD_RED_POINTS
+            red_hold[i] = 1
         else:
-            dn[i] = 0.0  # filtered as likely noise/isolated artifact
+            if hold > 0:
+                label[i] = "RED"
+                red_hold[i] = 1
+                hold -= 1
 
-    return dn, hrv_step, rr_step, spo2_step, hrv_win, rr_win, spo2_win
+    # Provide a compact summary (final status)
+    final_status = "STABLE"
+    if np.any(label == "RED"):
+        final_status = "PRE-FAILURE ALERT"
+    elif np.any(label == "WARNING"):
+        final_status = "WARNING"
+    elif np.any(label == "INFO"):
+        final_status = "INFO"
 
-def dn_state(dn):
-    states = []
-    for v in dn:
-        if v >= THR_RED:
-            states.append("RED")
-        elif v >= THR_AMBER:
-            states.append("AMBER")
+    df = pd.DataFrame({
+        "t(min)": np.arange(1, len(hrv)+1),
+        "HRV": hrv,
+        "RR": rr,
+        "SpO2": spo2,
+        "%dHRV": np.round(p_hrv, 2),
+        "%dRR": np.round(p_rr, 2),
+        "%dSpO2": np.round(p_spo2, 2),
+        "sev_HRV": np.round(sev_hrv, 3),
+        "sev_RR": np.round(sev_rr, 3),
+        "sev_SpO2": np.round(sev_spo2, 3),
+        "DN_raw": np.round(dn_raw, 3),
+        "DN_roll": np.round(dn_roll, 3),
+        "label": label
+    })
+
+    return df, final_status
+
+def make_plot(df: pd.DataFrame, title_suffix="(static)"):
+    x = df["t(min)"].tolist()
+    y = df["DN_roll"].tolist()
+    labels = df["label"].tolist()
+
+    # color map
+    c = []
+    for lb in labels:
+        if lb == "RED":
+            c.append("#d62728")
+        elif lb == "WARNING":
+            c.append("#ff7f0e")
+        elif lb == "INFO":
+            c.append("#1f77b4")
         else:
-            states.append("GREEN")
-    return states
-
-def render_status_box(state_now: str):
-    if state_now == "RED":
-        st.error("🔴 PRE-FAILURE ALERT (DN_dynamic)")
-        st.caption("Sustained multi-system drift detected (rolling window).")
-    elif state_now == "AMBER":
-        st.warning("🟡 MONITOR CLOSELY (DN_dynamic)")
-        st.caption("Multi-system drift rising—watch trend.")
-    else:
-        st.success("🟢 STABLE (DN_dynamic)")
-        st.caption("No sustained multi-system drift detected.")
-
-def dn_plot(dn, states, upto_idx):
-    color_map = {"GREEN": "#2ecc71", "AMBER": "#f1c40f", "RED": "#e74c3c"}
-    colors = [color_map[s] for s in states[:upto_idx]]
+            c.append("#2ca02c")
 
     fig = go.Figure()
+
     fig.add_trace(go.Scatter(
-        x=list(range(1, upto_idx + 1)),
-        y=dn[:upto_idx],
+        x=x, y=y,
         mode="lines+markers",
-        marker=dict(color=colors, size=9),
-        line=dict(color="gray", width=2)
+        marker=dict(size=9, color=c),
+        line=dict(width=2, color="#111111"),
+        name="DN dynamic"
     ))
-    fig.add_hline(y=THR_AMBER, line_dash="dot", line_color="gray")
-    fig.add_hline(y=THR_RED, line_dash="dot", line_color="gray")
+
+    # add threshold lines
+    fig.add_hline(y=DN_WARN, line_dash="dot")
+    fig.add_hline(y=DN_RED,  line_dash="dot")
+
     fig.update_layout(
-        height=380,
-        margin=dict(l=20, r=20, t=30, b=20),
+        title=f"DN dynamic {title_suffix}",
+        height=520,
+        margin=dict(l=40, r=20, t=60, b=50),
         xaxis_title="Time (minute index)",
-        yaxis_title=f"DN_dynamic (rolling W={W})",
+        yaxis_title="DN dynamic (rolling 5-min)",
         showlegend=False
     )
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=x,
+        ticktext=[str(i) for i in x],
+        range=[1, N]
+    )
+    fig.update_yaxes(range=[0, 1.0])
     return fig
 
 # =========================
 # UI
 # =========================
-st.set_page_config(layout="wide")
-st.title("DN Dynamic ICU Demo (HRV · RR · SpO₂)")
+st.title("DN alert demo")
 st.caption("Baseline-free + rolling drift + false-alarm filtering (≥2 systems)")
 
-if "playing" not in st.session_state:
-    st.session_state.playing = False
-if "play_idx" not in st.session_state:
-    st.session_state.play_idx = 1
+colL, colR = st.columns([1.05, 1.25], gap="large")
 
-left, right = st.columns([1, 1.3])
+with colL:
+    st.subheader("Input (15 points each)")
 
-with left:
-    st.subheader("Input (30 points each)")
-
-    hrv_txt = st.text_area(
+    hrv_text = st.text_area(
         "HRV (ms)",
-        "45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 "
-        "29 28 27 26 25 24 23 22 21 20 19 18 17 16"
+        value="45 44 42 35 36 32 30 28 27 22 24 23 21 20 19",
+        height=90
     )
-    rr_txt = st.text_area(
+    rr_text = st.text_area(
         "RR (breaths/min)",
-        "14 14 14 15 15 16 16 17 18 18 19 19 20 20 21 "
-        "21 22 22 23 23 24 24 25 26 26 27 27 28 28 29"
+        value="14 14 15 15 16 16 17 18 19 20 21 22 23 24 25",
+        height=90
     )
-    spo2_txt = st.text_area(
+    spo2_text = st.text_area(
         "SpO₂ (%)",
-        "98 98 98 97 97 96 96 95 95 94 94 93 93 92 92 "
-        "91 91 90 90 89 89 88 88 87 87 86 86 85 85 84"
+        value="98 97 92 97 95 94 94 92 93 89 90 90 91 90 89",
+        height=90
     )
 
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        static_btn = st.button("Run static analysis")
-    with c2:
-        play_btn = st.button("▶ Play simulation (3s)")
-    with c3:
-        stop_btn = st.button("Stop")
+    c1, c2, c3 = st.columns([1,1,1])
+    run_static = c1.button("Run static", use_container_width=True)
+    play = c2.button("▶ Play (3s/step)", use_container_width=True)
+    stop = c3.button("Stop", use_container_width=True)
 
-    st.caption(f"K: HRV={K_HRV}, RR={K_RR}, SpO₂={K_SPO2} | Rolling W={W} | Need ≥2 systems | Input={N_POINTS} points")
+    if "stop_flag" not in st.session_state:
+        st.session_state.stop_flag = False
+    if stop:
+        st.session_state.stop_flag = True
+    if play:
+        st.session_state.stop_flag = False
 
-def validate_and_trim(hrv_all, rr_all, spo2_all):
-    if len(hrv_all) < N_POINTS or len(rr_all) < N_POINTS or len(spo2_all) < N_POINTS:
-        return None, None, None, "Please provide at least 30 values for EACH signal."
-    return hrv_all[:N_POINTS], rr_all[:N_POINTS], spo2_all[:N_POINTS], None
-
-if stop_btn:
-    st.session_state.playing = False
-    st.session_state.play_idx = 1
-
-if play_btn:
-    st.session_state.playing = True
-    st.session_state.play_idx = 1
-
-with right:
-    status_box = st.container()
+with colR:
+    status_box = st.empty()
     chart_box = st.empty()
+    table_box = st.empty()
 
-    try:
-        hrv_all = parse_series(hrv_txt)
-        rr_all = parse_series(rr_txt)
-        spo2_all = parse_series(spo2_txt)
-        hrv, rr, spo2, err = validate_and_trim(hrv_all, rr_all, spo2_all)
-    except Exception:
-        err = "Input format error: please use numbers separated by spaces."
-        hrv = rr = spo2 = None
+def get_inputs_or_stop():
+    hrv = parse_series(hrv_text)[:N]
+    rr  = parse_series(rr_text)[:N]
+    spo2= parse_series(spo2_text)[:N]
 
-    if err:
-        st.error(err)
+    if len(hrv) < N or len(rr) < N or len(spo2) < N:
+        st.error("Please input exactly 15 numbers for each signal.")
+        st.stop()
+    return hrv, rr, spo2
+
+def render_static():
+    hrv, rr, spo2 = get_inputs_or_stop()
+    df, final_status = compute_dn(hrv, rr, spo2)
+
+    if final_status == "PRE-FAILURE ALERT":
+        status_box.error(f"● {final_status} (DN_dynamic)")
+    elif final_status == "WARNING":
+        status_box.warning(f"● {final_status} (DN_dynamic)")
+    elif final_status == "INFO":
+        status_box.info(f"● {final_status} (DN_dynamic)")
     else:
-        dn, hrv_step, rr_step, spo2_step, hrv_win, rr_win, spo2_win = dn_dynamic(hrv, rr, spo2)
-        states = dn_state(dn)
+        status_box.success(f"● {final_status} (DN_dynamic)")
 
-        if static_btn and not st.session_state.playing:
-            with status_box:
-                render_status_box(states[-1])
-            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=N_POINTS), use_container_width=True)
+    fig = make_plot(df, "(static)")
+    chart_box.plotly_chart(fig, use_container_width=True)
 
-        elif st.session_state.playing:
-            idx = int(st.session_state.play_idx)
-            idx = max(1, min(idx, N_POINTS))
+    # compact table (optional, still useful)
+    show_cols = ["t(min)", "HRV", "RR", "SpO2", "%dHRV", "%dRR", "%dSpO2", "DN_roll", "label"]
+    table_box.dataframe(df[show_cols], use_container_width=True, height=260)
 
-            with status_box:
-                render_status_box(states[idx - 1])
+def render_play():
+    hrv, rr, spo2 = get_inputs_or_stop()
+    df_full, _ = compute_dn(hrv, rr, spo2)
 
-            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=idx), use_container_width=True)
+    for k in range(1, N+1):
+        if st.session_state.stop_flag:
+            break
 
-            if idx >= N_POINTS:
-                st.session_state.playing = False
-                st.session_state.play_idx = 1
-            else:
-                time.sleep(STEP_SECONDS)
-                st.session_state.play_idx = idx + 1
-                _rerun()
+        df = df_full.iloc[:k].copy()
 
+        # status based on visible window
+        labels = df["label"].values
+        if np.any(labels == "RED"):
+            status_box.error("● PRE-FAILURE ALERT (DN_dynamic)")
+        elif np.any(labels == "WARNING"):
+            status_box.warning("● WARNING (DN_dynamic)")
+        elif np.any(labels == "INFO"):
+            status_box.info("● INFO (DN_dynamic)")
         else:
-            st.info("Press **Run static analysis** or **Play simulation (3s)**.")
-            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=1), use_container_width=True)
+            status_box.success("● STABLE (DN_dynamic)")
+
+        fig = make_plot(df, f"(play: 1→{k})")
+        chart_box.plotly_chart(fig, use_container_width=True)
+
+        time.sleep(3)
+
+# Auto-run
+if run_static:
+    render_static()
+elif play:
+    render_play()
+else:
+    # default: show static once at load (nice for video)
+    render_static()

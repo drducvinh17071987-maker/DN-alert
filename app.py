@@ -1,316 +1,421 @@
+# app.py
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 
+# -----------------------------
+# Parsing helpers
+# -----------------------------
+def parse_series(text: str, n: int = 15) -> np.ndarray:
+    """
+    Accepts space/comma/newline separated numbers.
+    """
+    if text is None:
+        return np.array([])
+    s = text.replace(",", " ").replace("\n", " ").strip()
+    if not s:
+        return np.array([])
+    parts = [p for p in s.split(" ") if p.strip() != ""]
+    arr = np.array([float(p) for p in parts], dtype=float)
+    if len(arr) != n:
+        raise ValueError(f"Need exactly {n} values, got {len(arr)}")
+    return arr
+
+def pct_change(x: np.ndarray) -> np.ndarray:
+    """% change between consecutive points. First point = 0."""
+    out = np.zeros_like(x, dtype=float)
+    for i in range(1, len(x)):
+        prev = x[i-1]
+        if prev == 0:
+            out[i] = 0.0
+        else:
+            out[i] = 100.0 * (x[i] - prev) / prev
+    return out
+
+def rolling_mean(x: np.ndarray, w: int) -> np.ndarray:
+    out = np.zeros_like(x, dtype=float)
+    for i in range(len(x)):
+        j0 = max(0, i - w + 1)
+        out[i] = float(np.mean(x[j0:i+1]))
+    return out
+
+# -----------------------------
+# DN core (SHOCK + DRIFT)
+# -----------------------------
+def compute_channel_spo2(spo2: np.ndarray, k_spo2: float = 5.0, w: int = 5):
+    """
+    TT_shock = ΔSpO2 / K  (unit: %point per minute)
+    TT_drift = (SpO2 - rolling_mean(SpO2,w)) / K
+    Use abs(TT) for thresholding; keep sign for plots if needed.
+    V-shape: drop then recover quickly => INFO (false-alarm filter)
+    """
+    n = len(spo2)
+    delta = np.zeros(n)
+    delta[1:] = spo2[1:] - spo2[:-1]
+
+    tt_shock = delta / k_spo2
+
+    rm = rolling_mean(spo2, w)
+    tt_drift = (spo2 - rm) / k_spo2
+
+    # V-shape detector (simple & conservative):
+    # A sharp drop then sharp rebound within 2 steps.
+    vshape = np.zeros(n, dtype=bool)
+    for i in range(2, n):
+        d1 = spo2[i-1] - spo2[i-2]
+        d2 = spo2[i]   - spo2[i-1]
+        # drop then rebound, and rebound cancels most of drop
+        if d1 <= -2 and d2 >= 2 and abs((d1 + d2)) <= 1:
+            vshape[i] = True
+
+    # thresholds on |T|
+    abs_shock = np.abs(tt_shock)
+    abs_drift = np.abs(tt_drift)
+    abs_T = np.maximum(abs_shock, abs_drift)  # combine shock+drift
+
+    label = np.array(["GREEN"] * n, dtype=object)
+    label[abs_T >= 0.3] = "WARNING"
+    label[abs_T >= 0.6] = "RED"
+
+    # V-shape overrides to INFO (filter), but only if it was WARNING/RED
+    label[vshape & (label != "GREEN")] = "INFO"
+
+    # E / vT / vE (Lorentz form) using combined T with sign from shock (fallback drift)
+    # NOTE: we only need magnitude for alerting; for E we keep a signed T (choose bigger contributor)
+    t_signed = np.where(np.abs(tt_shock) >= np.abs(tt_drift), tt_shock, tt_drift)
+    e = 1.0 - (t_signed ** 2)
+    vT = np.zeros(n)
+    vE = np.zeros(n)
+    vT[1:] = t_signed[1:] - t_signed[:-1]
+    vE[1:] = e[1:] - e[:-1]
+
+    return {
+        "TT_shock": tt_shock, "TT_drift": tt_drift,
+        "T": t_signed, "E": e, "vT": vT, "vE": vE,
+        "label": label, "vshape": vshape
+    }
+
+def compute_channel_rr(rr: np.ndarray, k_rr: float = 25.0, w: int = 5):
+    """
+    RR uses % change per minute:
+      TT_shock = (%ΔRR) / K_rr
+      TT_drift = (%Δ vs rolling mean) / K_rr
+    Threshold suggestion (per your note):
+      |T|~0.5 ~ WARNING, |T|>=1 ~ RED
+    We'll use:
+      WARNING if |T|>=0.5
+      RED if |T|>=1.0
+    """
+    n = len(rr)
+    pct = pct_change(rr)  # %Δ between points
+    tt_shock = pct / k_rr
+
+    rm = rolling_mean(rr, w)
+    # % difference to rolling mean:
+    pct_rm = np.zeros(n)
+    for i in range(n):
+        base = rm[i]
+        if base == 0:
+            pct_rm[i] = 0.0
+        else:
+            pct_rm[i] = 100.0 * (rr[i] - base) / base
+    tt_drift = pct_rm / k_rr
+
+    abs_T = np.maximum(np.abs(tt_shock), np.abs(tt_drift))
+
+    label = np.array(["GREEN"] * n, dtype=object)
+    label[abs_T >= 0.5] = "WARNING"
+    label[abs_T >= 1.0] = "RED"
+
+    # V-shape filter for RR (rare, conservative): spike up then down quickly
+    vshape = np.zeros(n, dtype=bool)
+    for i in range(2, n):
+        d1 = rr[i-1] - rr[i-2]
+        d2 = rr[i]   - rr[i-1]
+        if d1 >= 3 and d2 <= -3 and abs(d1 + d2) <= 1:
+            vshape[i] = True
+    label[vshape & (label != "GREEN")] = "INFO"
+
+    t_signed = np.where(np.abs(tt_shock) >= np.abs(tt_drift), tt_shock, tt_drift)
+    e = 1.0 - (t_signed ** 2)
+    vT = np.zeros(n)
+    vE = np.zeros(n)
+    vT[1:] = t_signed[1:] - t_signed[:-1]
+    vE[1:] = e[1:] - e[:-1]
+
+    return {
+        "TT_shock": tt_shock, "TT_drift": tt_drift,
+        "T": t_signed, "E": e, "vT": vT, "vE": vE,
+        "label": label, "vshape": vshape
+    }
+
+def compute_channel_hrv_shape(hrv: np.ndarray, k_hrv: float = 80.0, w: int = 5):
+    """
+    HRV: baseline-free shape.
+    We'll implement:
+      - TT_shock = (%ΔHRV)/K
+      - TT_drift = (%Δ vs rolling mean)/K
+      - V-shape recovery => INFO (filter)
+    We DO NOT use absolute HRV level or personal baseline.
+    Thresholds: keep conservative to reduce false alarms:
+      WARNING if |T|>=0.35
+      RED if |T|>=0.60
+    (You can tune later; logic structure is what's important.)
+    """
+    n = len(hrv)
+    pct = pct_change(hrv)
+    tt_shock = pct / k_hrv
+
+    rm = rolling_mean(hrv, w)
+    pct_rm = np.zeros(n)
+    for i in range(n):
+        base = rm[i]
+        if base == 0:
+            pct_rm[i] = 0.0
+        else:
+            pct_rm[i] = 100.0 * (hrv[i] - base) / base
+    tt_drift = pct_rm / k_hrv
+
+    # V-shape recovery: drop then rebound within 2 steps
+    vshape = np.zeros(n, dtype=bool)
+    for i in range(2, n):
+        d1 = hrv[i-1] - hrv[i-2]
+        d2 = hrv[i]   - hrv[i-1]
+        # relative to previous step size (avoid noise)
+        if d1 <= -5 and d2 >= 5 and abs(d1 + d2) <= 2:
+            vshape[i] = True
+
+    abs_T = np.maximum(np.abs(tt_shock), np.abs(tt_drift))
+
+    label = np.array(["GREEN"] * n, dtype=object)
+    label[abs_T >= 0.35] = "WARNING"
+    label[abs_T >= 0.60] = "RED"
+    label[vshape & (label != "GREEN")] = "INFO"
+
+    t_signed = np.where(np.abs(tt_shock) >= np.abs(tt_drift), tt_shock, tt_drift)
+    e = 1.0 - (t_signed ** 2)
+    vT = np.zeros(n)
+    vE = np.zeros(n)
+    vT[1:] = t_signed[1:] - t_signed[:-1]
+    vE[1:] = e[1:] - e[:-1]
+
+    return {
+        "TT_shock": tt_shock, "TT_drift": tt_drift,
+        "T": t_signed, "E": e, "vT": vT, "vE": vE,
+        "label": label, "vshape": vshape
+    }
+
+def fuse_gatekeeper(lbl_hrv, lbl_rr, lbl_spo2):
+    """
+    DN RED if >=2 systems are RED (INFO does not count as bad)
+    DN WARNING if >=2 systems are WARNING/RED
+    else GREEN
+    Output per-minute DN label.
+    """
+    n = len(lbl_hrv)
+    dn = np.array(["GREEN"] * n, dtype=object)
+
+    def is_red(x): return x == "RED"
+    def is_warn_or_red(x): return x in ("WARNING", "RED")
+
+    for i in range(n):
+        reds = sum([is_red(lbl_hrv[i]), is_red(lbl_rr[i]), is_red(lbl_spo2[i])])
+        warns = sum([is_warn_or_red(lbl_hrv[i]), is_warn_or_red(lbl_rr[i]), is_warn_or_red(lbl_spo2[i])])
+
+        if reds >= 2:
+            dn[i] = "RED"
+        elif warns >= 2:
+            dn[i] = "WARNING"
+        else:
+            dn[i] = "GREEN"
+    return dn
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def label_to_color(lbl: str) -> str:
+    if lbl == "RED":
+        return "red"
+    if lbl == "WARNING":
+        return "gold"
+    if lbl == "INFO":
+        return "deepskyblue"
+    return "green"
+
+def plot_dn(mins, dn_label, title="DN alert demo"):
+    y = np.where(dn_label == "GREEN", 0, np.where(dn_label == "WARNING", 1, 2))
+    fig, ax = plt.subplots()
+    ax.plot(mins, y, linewidth=2)
+
+    # scatter with true colors
+    for i in range(len(mins)):
+        ax.scatter(mins[i], y[i], s=60, color=label_to_color(dn_label[i]))
+
+    ax.set_yticks([0, 1, 2])
+    ax.set_yticklabels(["GREEN", "WARNING", "RED"])
+    ax.set_xticks(mins)
+    ax.set_xlabel("Minute")
+    ax.set_ylabel("DN state")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    st.pyplot(fig)
+
+def plot_channel_T(mins, ch, name):
+    T = ch["T"]
+    fig, ax = plt.subplots()
+    ax.plot(mins, T, linewidth=2)
+    for i in range(len(mins)):
+        ax.scatter(mins[i], T[i], s=35, color=label_to_color(ch["label"][i]))
+    ax.axhline(0.0, linewidth=1)
+    ax.set_xticks(mins)
+    ax.set_xlabel("Minute")
+    ax.set_ylabel("T (signed)")
+    ax.set_title(f"{name}: T (shock/drift) with labels")
+    ax.grid(True, alpha=0.3)
+    st.pyplot(fig)
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.set_page_config(page_title="DN alert demo", layout="wide")
 st.title("DN alert demo")
-st.caption("Gatekeeper: DN RED if ≥2 systems are RED; DN WARNING if ≥2 systems are WARNING/RED. Runs only on button clicks.")
+st.caption("DN_dynamic (baseline-free): SHOCK + DRIFT + V-shape filtering, then Gatekeeper (≥2 systems).")
 
-# ----------------------------
-# Utils
-# ----------------------------
-def parse_15(text: str):
-    text = text.replace(",", " ").replace("\n", " ").strip()
-    if not text:
-        return []
-    vals = []
-    for p in text.split():
-        try:
-            vals.append(float(p))
-        except:
-            pass
-    return vals[:15]
+N = 15
 
-def pct_change(prev, cur):
-    if prev == 0:
-        return 0.0
-    return 100.0 * (cur - prev) / prev
+if "play" not in st.session_state:
+    st.session_state.play = False
+if "play_i" not in st.session_state:
+    st.session_state.play_i = 0
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
 
-def color_map(label):
-    if label == "RED":
-        return "#d62728"
-    if label == "WARNING":
-        return "#ffbf00"
-    if label == "INFO":
-        return "#1f77b4"
-    return "#2ca02c"  # GREEN
+colL, colR = st.columns([1, 1])
 
-def dn_gatekeeper(hrv_label, rr_label, spo2_label):
-    # INFO does NOT count as WARNING/RED; it's used for noise/recovery notes.
-    labels = [hrv_label, rr_label, spo2_label]
-    red_cnt = sum(x == "RED" for x in labels)
-    warn_cnt = sum(x in ("RED", "WARNING") for x in labels)
+with colL:
+    st.subheader("Input (15 points each)")
+    hrv_txt = st.text_area("HRV (ms)", value="40 40 41 40 39 39 38 38 37 37 36 36 35 35 35", height=90)
+    rr_txt  = st.text_area("RR (breaths/min)", value="15 16 17 18 19 20 22 24 26 28 30 30 31 32 32", height=90)
+    spo2_txt= st.text_area("SpO₂ (%)", value="98 97 96 95 94 93 92 91 90 90 89 89 88 88 88", height=90)
 
-    if red_cnt >= 2:
-        return "RED"
-    if warn_cnt >= 2:
-        return "WARNING"
-    return "GREEN"
+    with st.expander("Settings (hidden by default)"):
+        w = st.slider("Rolling window W (minutes)", min_value=3, max_value=7, value=5, step=1)
+        k_spo2 = st.number_input("K_spo2 (Δ%point per min)", value=5.0, step=0.5)
+        k_rr   = st.number_input("K_rr (%Δ per min)", value=25.0, step=1.0)
+        k_hrv  = st.number_input("K_hrv (%Δ per min)", value=80.0, step=5.0)
 
-# ----------------------------
-# Per-system rules (your spec)
-# ----------------------------
-K_SPO2 = 5.0
-K_RR = 25.0
-K_HRV = 80.0  # dynamic normalization for %ΔHRV if needed
+    c1, c2, c3 = st.columns([1,1,1])
+    run_static = c1.button("Run static")
+    play_btn   = c2.button("Play (3s/step)")
+    stop_btn   = c3.button("Stop")
 
-def spo2_label(prev, cur, next_val=None):
-    """
-    T = ΔSpO2 / 5 (abs drop)
-    |T|>=0.6 RED (~3% drop), |T|>=0.3 WARNING (~1.5% drop)
-    V-shape (drop then immediate recovery) -> INFO
-    """
-    drop = max(0.0, prev - cur)           # absolute drop
-    T = drop / K_SPO2
+    st.write("Note: App updates only when you press a button (no auto-run on edit).")
 
-    # V-shape noise/recovery check (needs next point)
-    if next_val is not None:
-        rec = max(0.0, next_val - cur)    # recovery amount
-        # if it drops then rebounds quickly close to prior level -> INFO
-        if drop >= 2.0 and rec >= 2.0 and abs(next_val - prev) <= 1.0:
-            return "INFO", T
+def compute_all():
+    hrv = parse_series(hrv_txt, N)
+    rr  = parse_series(rr_txt, N)
+    spo2= parse_series(spo2_txt, N)
 
-    if T >= 0.6:
-        return "RED", T
-    if T >= 0.3:
-        return "WARNING", T
-    return "GREEN", T
+    ch_hrv  = compute_channel_hrv_shape(hrv, k_hrv=k_hrv, w=w)
+    ch_rr   = compute_channel_rr(rr, k_rr=k_rr, w=w)
+    ch_spo2 = compute_channel_spo2(spo2, k_spo2=k_spo2, w=w)
 
-def rr_label(prev, cur):
-    """
-    T = %ΔRR / 25
-    T>=1 RED (≥25%/min), T>=0.5 WARNING (~12–15%), T>=0.2 INFO (~5–8%)
-    """
-    d = pct_change(prev, cur)
-    up = max(0.0, d)
-    T = up / K_RR
-    if T >= 1.0:
-        return "RED", T
-    if T >= 0.5:
-        return "WARNING", T
-    if T >= 0.2:
-        return "INFO", T
-    return "GREEN", T
+    dn = fuse_gatekeeper(ch_hrv["label"], ch_rr["label"], ch_spo2["label"])
 
-def hrv_label(hrv_series, i):
-    """
-    HRV uses *shape*, not absolute value.
-    - Uses %ΔHRV step, vT, V-shape, drift.
-    - Step-drop ≤ -40% => RED (unless immediate V-shape recovery => INFO)
-    - V-shape: d1<=-20% and d2>=+15% and |total|<=12% => INFO (noise/recovery)
-    - Drift: if last 3 steps total_pct <= -15% => WARNING (soft drift)
-    """
-    if i == 0:
-        return "GREEN", 0.0, 0.0, 0.0  # label, d%, T, E
+    mins = np.arange(1, N+1)
 
-    prev = hrv_series[i-1]
-    cur = hrv_series[i]
-    d = pct_change(prev, cur)  # %ΔHRV
-    # dynamic T on %ΔHRV (same spirit you used before)
-    T = d / K_HRV
-    E = 1.0 - (T * T)
+    df = pd.DataFrame({
+        "minute": mins,
+        "HRV": hrv, "RR": rr, "SpO2": spo2,
+        "HRV_label": ch_hrv["label"],
+        "RR_label": ch_rr["label"],
+        "SpO2_label": ch_spo2["label"],
+        "DN_label": dn,
+        "HRV_T": ch_hrv["T"], "HRV_E": ch_hrv["E"], "HRV_vT": ch_hrv["vT"], "HRV_vE": ch_hrv["vE"],
+        "RR_T": ch_rr["T"], "RR_E": ch_rr["E"], "RR_vT": ch_rr["vT"], "RR_vE": ch_rr["vE"],
+        "SpO2_T": ch_spo2["T"], "SpO2_E": ch_spo2["E"], "SpO2_vT": ch_spo2["vT"], "SpO2_vE": ch_spo2["vE"],
+    })
 
-    # Step-drop RED rule
-    if d <= -40.0:
-        # if immediate rebound next step -> treat as INFO (likely artifact)
-        if i + 1 < len(hrv_series):
-            d2 = pct_change(cur, hrv_series[i+1])
-            total = 100.0 * (hrv_series[i+1] - prev) / prev if prev != 0 else 0.0
-            if d <= -20.0 and d2 >= +15.0 and abs(total) <= 12.0:
-                return "INFO", d, T, E
-        return "RED", d, T, E
+    return mins, ch_hrv, ch_rr, ch_spo2, dn, df
 
-    # V-shape info (classic)
-    if i + 1 < len(hrv_series):
-        d2 = pct_change(cur, hrv_series[i+1])
-        total = 100.0 * (hrv_series[i+1] - prev) / prev if prev != 0 else 0.0
-        if d <= -20.0 and d2 >= +15.0 and abs(total) <= 12.0:
-            return "INFO", d, T, E
+# Handle buttons
+if stop_btn:
+    st.session_state.play = False
+    st.session_state.play_i = 0
 
-    # Drift over last 3 steps (soft, low false alarm)
-    if i >= 3:
-        base = hrv_series[i-3]
-        total3 = 100.0 * (cur - base) / base if base != 0 else 0.0
-        if total3 <= -15.0:
-            return "WARNING", d, T, E
+if run_static:
+    try:
+        st.session_state.last_result = compute_all()
+    except Exception as e:
+        st.session_state.last_result = None
+        with colR:
+            st.error(str(e))
 
-    return "GREEN", d, T, E
+if play_btn:
+    try:
+        st.session_state.last_result = compute_all()
+        st.session_state.play = True
+        st.session_state.play_i = 1
+    except Exception as e:
+        st.session_state.last_result = None
+        st.session_state.play = False
+        with colR:
+            st.error(str(e))
 
-# ----------------------------
-# Plotting
-# ----------------------------
-def plot_dn(df, upto):
-    d = df.iloc[:upto].copy()
-    x = d["minute"].to_list()
-    y = d["DN_level"].to_list()
-    colors = [color_map(s) for s in d["DN_status"].to_list()]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x, y=y,
-        mode="lines+markers",
-        line=dict(width=3),
-        marker=dict(size=10, color=colors, line=dict(width=1, color="#111111")),
-        name="DN"
-    ))
-    fig.update_layout(
-        height=430,
-        margin=dict(l=40, r=20, t=40, b=40),
-        xaxis_title="Minute",
-        yaxis_title="DN (GREEN=0, WARNING=1, RED=2)",
-        yaxis=dict(range=[-0.2, 2.2], dtick=1),
-    )
-    fig.update_xaxes(dtick=1)
-    return fig
-
-def plot_raw(df, upto):
-    d = df.iloc[:upto].copy()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=d["minute"], y=d["HRV"], mode="lines+markers", name="HRV"))
-    fig.add_trace(go.Scatter(x=d["minute"], y=d["RR"], mode="lines+markers", name="RR"))
-    fig.add_trace(go.Scatter(x=d["minute"], y=d["SpO2"], mode="lines+markers", name="SpO2"))
-    fig.update_layout(
-        height=430,
-        margin=dict(l=40, r=20, t=40, b=40),
-        xaxis_title="Minute",
-        yaxis_title="Raw values",
-    )
-    fig.update_xaxes(dtick=1)
-    return fig
-
-# ----------------------------
-# UI Layout
-# ----------------------------
-left, right = st.columns([1, 1.25], gap="large")
-
-with left:
-    st.subheader("Input (15 points)")
-    default_hrv = "45 44 42 35 36 32 30 28 27 22 24 23 21 20 19"
-    default_rr = "14 14 15 15 16 16 17 18 19 20 21 22 23 24 25"
-    default_spo2 = "98 97 92 97 95 94 94 92 93 89 90 91 90 89 89"
-
-    hrv_txt = st.text_area("HRV (ms)", default_hrv, height=80)
-    rr_txt = st.text_area("RR (breaths/min)", default_rr, height=80)
-    spo2_txt = st.text_area("SpO₂ (%)", default_spo2, height=80)
-
-    cA, cB = st.columns(2)
-    with cA:
-        static_btn = st.button("Run static", use_container_width=True)
-    with cB:
-        play_btn = st.button("Play (3s/step)", use_container_width=True)
-
-    st.markdown("**Note:** App only updates when you press a button (no auto-run on edit).")
-
-# session state
-if "computed_df" not in st.session_state:
-    st.session_state.computed_df = None
-if "playing" not in st.session_state:
-    st.session_state.playing = False
-
-# Build DF only on button click
-def compute_df(hrv, rr, spo2):
-    n = 15
-    rows = []
-    for i in range(n):
-        # HRV
-        h_label, d_hrv, T_hrv, E_hrv = hrv_label(hrv, i)
-
-        # RR
-        if i == 0:
-            r_label, T_rr = "GREEN", 0.0
-            d_rr = 0.0
-        else:
-            r_label, T_rr = rr_label(rr[i-1], rr[i])
-            d_rr = pct_change(rr[i-1], rr[i])
-
-        # SpO2
-        if i == 0:
-            s_label, T_sp = "GREEN", 0.0
-            d_sp = 0.0
-        else:
-            next_val = spo2[i+1] if i + 1 < n else None
-            s_label, T_sp = spo2_label(spo2[i-1], spo2[i], next_val=next_val)
-            d_sp = spo2[i] - spo2[i-1]
-
-        dn = dn_gatekeeper(h_label, r_label, s_label)
-
-        dn_level = 0
-        if dn == "WARNING":
-            dn_level = 1
-        elif dn == "RED":
-            dn_level = 2
-
-        rows.append({
-            "minute": i + 1,
-            "HRV": hrv[i],
-            "RR": rr[i],
-            "SpO2": spo2[i],
-            "%dHRV": d_hrv if i > 0 else 0.0,
-            "%dRR": d_rr if i > 0 else 0.0,
-            "dSpO2": d_sp if i > 0 else 0.0,
-            "T_hrv": T_hrv,
-            "E_hrv": E_hrv,
-            "T_rr": T_rr,
-            "T_spo2": T_sp,
-            "HRV_status": h_label,
-            "RR_status": r_label,
-            "SpO2_status": s_label,
-            "DN_status": dn,
-            "DN_level": dn_level
-        })
-    return pd.DataFrame(rows)
-
-def validate_inputs(hrv, rr, spo2):
-    return len(hrv) == 15 and len(rr) == 15 and len(spo2) == 15
-
-# button actions
-hrv = parse_15(hrv_txt)
-rr = parse_15(rr_txt)
-spo2 = parse_15(spo2_txt)
-
-if static_btn or play_btn:
-    if not validate_inputs(hrv, rr, spo2):
-        with right:
-            st.error("Bạn phải nhập đúng **15 số** cho mỗi dãy HRV / RR / SpO₂.")
-        st.stop()
-    st.session_state.computed_df = compute_df(hrv, rr, spo2)
-
-# Render output
-with right:
+with colR:
     st.subheader("Output")
 
-    df = st.session_state.computed_df
-    if df is None:
-        st.info("Nhập 15 điểm cho mỗi chỉ số, rồi bấm **Run static** hoặc **Play**.")
-        st.stop()
+    if st.session_state.last_result is None:
+        st.info("Press **Run static** or **Play** to compute.")
+    else:
+        mins, ch_hrv, ch_rr, ch_spo2, dn, df = st.session_state.last_result
 
-    # Summary minutes
-    red_minutes = df.loc[df["DN_status"] == "RED", "minute"].tolist()
-    warn_minutes = df.loc[df["DN_status"] == "WARNING", "minute"].tolist()
+        if st.session_state.play:
+            i = st.session_state.play_i
+            if i > N:
+                st.session_state.play = False
+                i = N
 
-    st.write(f"**DN RED minutes:** {red_minutes if red_minutes else 'None'}")
-    st.write(f"**DN WARNING minutes:** {warn_minutes if warn_minutes else 'None'}")
+            # show partial up to i
+            mins_p = mins[:i]
+            dn_p = dn[:i]
 
-    ph1 = st.empty()
-    ph2 = st.empty()
-    ph3 = st.empty()
+            # summary at current minute
+            cur = i - 1
+            st.markdown(f"**Current minute:** {i}")
+            st.markdown(
+                f"- HRV: **{ch_hrv['label'][cur]}** | RR: **{ch_rr['label'][cur]}** | SpO₂: **{ch_spo2['label'][cur]}**"
+            )
+            st.markdown(f"- DN: **{dn[cur]}**")
 
-    def render(upto):
-        ph1.plotly_chart(plot_dn(df, upto), use_container_width=True)
-        ph2.plotly_chart(plot_raw(df, upto), use_container_width=True)
+            plot_dn(mins_p, dn_p, title="DN alert demo (PLAY)")
+            # optional channel plots in play mode (comment out if you want simpler)
+            # plot_channel_T(mins_p, {k: v[:i] if isinstance(v, np.ndarray) else v for k,v in ch_spo2.items()}, "SpO₂")
 
-        with ph3.container():
-            st.markdown("### Table (per minute)")
-            st.dataframe(df.iloc[:upto], use_container_width=True, height=320)
+            with st.expander("Details (per-minute table)"):
+                st.dataframe(df.iloc[:i], use_container_width=True)
 
-    # Static
-    if static_btn and not play_btn:
-        render(15)
-
-    # Play
-    if play_btn:
-        for upto in range(1, 16):
-            render(upto)
+            # advance
+            st.session_state.play_i = i + 1
             time.sleep(3)
+            st.rerun()
+        else:
+            # Static view
+            red_mins = [int(m) for m in mins[dn == "RED"]]
+            warn_mins = [int(m) for m in mins[dn == "WARNING"]]
+
+            st.write(f"DN RED minutes: {red_mins if red_mins else 'None'}")
+            st.write(f"DN WARNING minutes: {warn_mins if warn_mins else 'None'}")
+
+            plot_dn(mins, dn, title=f"DN alert demo (STATIC) | W={w}")
+            st.caption("Dots are colored by DN label per minute (GREEN/WARNING/RED).")
+
+            with st.expander("Channel T plots (optional)"):
+                plot_channel_T(mins, ch_hrv, "HRV")
+                plot_channel_T(mins, ch_rr, "RR")
+                plot_channel_T(mins, ch_spo2, "SpO₂")
+
+            with st.expander("Details (per-minute table: TT/E/vT/vE + labels)"):
+                st.dataframe(df, use_container_width=True)

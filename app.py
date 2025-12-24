@@ -1,337 +1,366 @@
 import time
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
-
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
+st.set_page_config(page_title="DN alert demo", layout="wide")
 
-# =========================
-# Config (chốt theo bạn)
-# =========================
-@dataclass
-class DNConfig:
-    # Normalization constants (fixed)
-    K_HRV_DROP_PCT: float = 40.0     # 40% drop ~ severe step (low false alarm friendly)
-    K_RR_UP_PCT: float = 25.0        # chốt theo bạn (saved)
-    K_SPO2_DROP_ABS: float = 5.0     # chốt theo bạn
-
-    # EWMA drift
-    ALPHA: float = 0.80             # prioritize low false alarms (smoother)
-    PERSIST_MIN: int = 3            # need >=3 consecutive minutes
-
-    # Drift thresholds (tune for low false alarms)
-    WARN_THR: float = 0.25
-    RED_THR: float = 0.35
-
-    # SHOCK thresholds (between two points) - strict to reduce false alarms
-    SHOCK_COMPONENT_THR: float = 0.85   # any single system huge step
-    SHOCK_FUSION_THR: float = 0.75      # mean-active huge step
-
-    # Window for "worst-in-window"
-    WORST_WINDOW: int = 5
-
-
-CFG = DNConfig()
-
-
-# =========================
+# -------------------------
 # Helpers
-# =========================
-def parse_series(text: str, n: int = 15) -> List[float]:
-    """
-    Accepts spaces/commas/newlines.
-    """
-    if text is None:
+# -------------------------
+def parse_series(text: str) -> list[float]:
+    if not text.strip():
         return []
-    cleaned = text.replace(",", " ").replace("\n", " ").strip()
-    if not cleaned:
-        return []
-    parts = [p for p in cleaned.split(" ") if p.strip() != ""]
-    vals = []
+    parts = text.replace(",", " ").split()
+    out = []
     for p in parts:
         try:
-            vals.append(float(p))
-        except Exception:
+            out.append(float(p))
+        except:
             pass
-    return vals[:n]
-
-
-def pct_change(prev: float, cur: float) -> float:
-    if prev == 0:
-        return 0.0
-    return 100.0 * (cur - prev) / prev
-
-
-def clip01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
-
-
-def mean_active(values: List[float]) -> float:
-    active = [v for v in values if v > 0]
-    if not active:
-        return 0.0
-    return float(sum(active) / len(active))
-
-
-def rolling_max(arr: np.ndarray, w: int) -> np.ndarray:
-    out = np.zeros_like(arr)
-    for i in range(len(arr)):
-        lo = max(0, i - w + 1)
-        out[i] = np.max(arr[lo:i+1])
     return out
 
-
-def consecutive_flags(x: np.ndarray, thr: float, k: int) -> np.ndarray:
+def pct_change(x: np.ndarray) -> np.ndarray:
     """
-    Returns boolean array where True means "thr exceeded for >=k consecutive steps up to i".
+    %Δ between consecutive points: 100*(x[i]-x[i-1])/x[i-1], first = 0.
     """
-    out = np.zeros_like(x, dtype=bool)
-    run = 0
-    for i, v in enumerate(x):
-        if v >= thr:
-            run += 1
+    x = np.asarray(x, dtype=float)
+    out = np.zeros_like(x, dtype=float)
+    for i in range(1, len(x)):
+        denom = x[i-1]
+        if denom == 0:
+            out[i] = 0.0
         else:
-            run = 0
-        out[i] = (run >= k)
+            out[i] = 100.0 * (x[i] - x[i-1]) / denom
     return out
 
+def clamp01(a):
+    return np.minimum(1.0, np.maximum(0.0, a))
 
-# =========================
-# Core DN computation
-# =========================
-def compute_dn(hrv: List[float], rr: List[float], spo2: List[float], cfg: DNConfig) -> pd.DataFrame:
-    n = min(len(hrv), len(rr), len(spo2))
-    if n < 2:
-        return pd.DataFrame()
+def ewma(series: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    EWMA smoothing: y[t]=alpha*y[t-1]+(1-alpha)*x[t]
+    """
+    x = np.asarray(series, dtype=float)
+    y = np.zeros_like(x, dtype=float)
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = alpha * y[i-1] + (1 - alpha) * x[i]
+    return y
 
-    hrv = np.array(hrv[:n], dtype=float)
-    rr = np.array(rr[:n], dtype=float)
-    spo2 = np.array(spo2[:n], dtype=float)
+def classify(dn_value: float, thr_warn: float, thr_red: float) -> str:
+    if dn_value >= thr_red:
+        return "RED"
+    if dn_value >= thr_warn:
+        return "WARNING"
+    return "GREEN"
 
-    # Per-minute step badness (between i-1 -> i), index i corresponds to "minute i+1"
-    bad_hrv = np.zeros(n)
-    bad_rr = np.zeros(n)
-    bad_spo2 = np.zeros(n)
-    s = np.zeros(n)
-    shock = np.zeros(n, dtype=bool)
+# -------------------------
+# DN core (baseline-free, multi-system)
+# -------------------------
+def compute_dn_dynamic(hrv, rr, spo2,
+                       K_hrv=80.0, K_rr=25.0, K_spo2=5.0,
+                       w=3,
+                       alpha=0.75,
+                       thr_warn=0.22, thr_red=0.35,
+                       shock_thr=0.35,
+                       min_systems_for_alert=2):
+    """
+    DN philosophy:
+    - Only %Δ is input; DN is not thresholding raw values.
+    - Convert each %Δ into a *badness step* (0..1) with proper direction:
+        HRV: drop is bad
+        RR: increase is bad
+        SpO2: drop is bad
+    - Require >=2 systems active to reduce false alarms (default).
+    - Two signals in parallel:
+        (A) SHOCK step alert: sudden multi-system event.
+        (B) DRIFT alert: sustained deterioration captured by EWMA + Worst-in-window.
+    """
 
-    for i in range(1, n):
-        # HRV: only drops are bad, measured in % drop
-        hrv_pct = pct_change(hrv[i-1], hrv[i])
-        hrv_drop = max(0.0, -hrv_pct)
-        bad_hrv[i] = clip01(hrv_drop / cfg.K_HRV_DROP_PCT)
+    n = len(hrv)
+    hrv = np.asarray(hrv, dtype=float)
+    rr = np.asarray(rr, dtype=float)
+    spo2 = np.asarray(spo2, dtype=float)
 
-        # RR: only rises are bad, measured in % up
-        rr_pct = pct_change(rr[i-1], rr[i])
-        rr_up = max(0.0, rr_pct)
-        bad_rr[i] = clip01(rr_up / cfg.K_RR_UP_PCT)
+    # %Δ
+    d_hrv = pct_change(hrv)     # negative is bad
+    d_rr = pct_change(rr)       # positive is bad
+    d_spo2 = pct_change(spo2)   # negative is bad
 
-        # SpO2: absolute drop is bad (more stable than %)
-        spo2_drop = max(0.0, spo2[i-1] - spo2[i])
-        bad_spo2[i] = clip01(spo2_drop / cfg.K_SPO2_DROP_ABS)
+    # Signed "bad direction" (positive means deterioration)
+    # HRV: drop => -d_hrv
+    # RR : rise => +d_rr
+    # SpO2: drop => -d_spo2
+    bad_hrv = np.maximum(0.0, (-d_hrv) / K_hrv)
+    bad_rr = np.maximum(0.0, ( d_rr) / K_rr)
+    bad_spo2 = np.maximum(0.0, (-d_spo2) / K_spo2)
 
-        s[i] = mean_active([bad_hrv[i], bad_rr[i], bad_spo2[i]])
+    bad_hrv = clamp01(bad_hrv)
+    bad_rr = clamp01(bad_rr)
+    bad_spo2 = clamp01(bad_spo2)
 
-        # SHOCK signal (strict for low false alarms)
-        if (bad_hrv[i] >= cfg.SHOCK_COMPONENT_THR or
-            bad_rr[i] >= cfg.SHOCK_COMPONENT_THR or
-            bad_spo2[i] >= cfg.SHOCK_COMPONENT_THR or
-            s[i] >= cfg.SHOCK_FUSION_THR):
-            shock[i] = True
+    # Active systems per minute (badness > 0)
+    active = (bad_hrv > 0).astype(int) + (bad_rr > 0).astype(int) + (bad_spo2 > 0).astype(int)
 
-    # EWMA drift (baseline-free, smooth)
-    drift = np.zeros(n)
-    for i in range(1, n):
-        drift[i] = cfg.ALPHA * drift[i-1] + (1.0 - cfg.ALPHA) * s[i]
+    # Mean-active fusion (only among active systems), else 0
+    mean_active = np.zeros(n, dtype=float)
+    for i in range(n):
+        vals = []
+        if bad_hrv[i] > 0: vals.append(bad_hrv[i])
+        if bad_rr[i] > 0: vals.append(bad_rr[i])
+        if bad_spo2[i] > 0: vals.append(bad_spo2[i])
+        mean_active[i] = float(np.mean(vals)) if len(vals) > 0 else 0.0
 
-    # Worst-in-window on drift (shows "approaching boundary" even if last step is small)
-    worst = rolling_max(drift, cfg.WORST_WINDOW)
+    # Multi-system gating (reduce false alarms)
+    dn_step = np.where(active >= min_systems_for_alert, mean_active, 0.0)
 
-    # Persistence flags (>=3 consecutive minutes)
-    warn_persist = consecutive_flags(worst, cfg.WARN_THR, cfg.PERSIST_MIN)
-    red_persist = consecutive_flags(worst, cfg.RED_THR, cfg.PERSIST_MIN)
+    # SHOCK: sudden multi-system spike OR very strong SpO2 drop with at least one support sign
+    shock = np.zeros(n, dtype=int)
+    max_bad = np.maximum.reduce([bad_hrv, bad_rr, bad_spo2])
+    support_for_spo2 = ((bad_rr > 0) | (bad_hrv > 0)).astype(int)
 
-    # Final per-minute label:
-    # - RED if shock OR red_persist
-    # - WARNING if warn_persist (and not RED)
-    label = np.array(["STABLE"] * n, dtype=object)
-    label[(warn_persist)] = "WARNING"
-    label[(red_persist)] = "RED"
-    label[(shock)] = "RED"  # shock overrides
+    for i in range(n):
+        is_multisys_spike = (active[i] >= min_systems_for_alert) and (max_bad[i] >= shock_thr)
+        is_spo2_critical = (bad_spo2[i] >= 0.60) and (support_for_spo2[i] == 1)  # anti false-alarm
+        shock[i] = 1 if (is_multisys_spike or is_spo2_critical) else 0
 
-    # Build table
-    minutes = np.arange(1, n + 1)
+    # DRIFT: EWMA on dn_step
+    dn_ewma = ewma(dn_step, alpha=alpha)
+
+    # Worst-in-window on dn_step (rolling max, inclusive)
+    w = int(max(2, w))
+    dn_worst = np.zeros(n, dtype=float)
+    for i in range(n):
+        lo = max(0, i - (w - 1))
+        dn_worst[i] = float(np.max(dn_step[lo:i+1]))
+
+    # Final DN = max(parallel signals)
+    dn_final = np.maximum(dn_ewma, dn_worst)
+
+    # Labels per minute
+    labels = [classify(dn_final[i], thr_warn, thr_red) for i in range(n)]
+
+    # Minutes lists (1-indexed minutes)
+    red_minutes = [i+1 for i, lb in enumerate(labels) if lb == "RED"]
+    warn_minutes = [i+1 for i, lb in enumerate(labels) if lb == "WARNING"]
+
+    # Also show shock minutes explicitly (can be RED even if drift low)
+    shock_minutes = [i+1 for i in range(n) if shock[i] == 1]
+
+    # Compute "T/E" per system for vt/ve visualization (DN spirit: dynamics)
+    # Here T_dyn = signed deterioration (not absolute):
+    T_hrv = (-d_hrv) / K_hrv
+    T_rr = ( d_rr) / K_rr
+    T_spo2 = (-d_spo2) / K_spo2
+
+    # Lorentz-like E (for visualization only)
+    E_hrv = 1.0 - np.square(T_hrv)
+    E_rr = 1.0 - np.square(T_rr)
+    E_spo2 = 1.0 - np.square(T_spo2)
+
+    vT_hrv = np.r_[0.0, np.diff(T_hrv)]
+    vT_rr = np.r_[0.0, np.diff(T_rr)]
+    vT_spo2 = np.r_[0.0, np.diff(T_spo2)]
+
+    vE_hrv = np.r_[0.0, np.diff(E_hrv)]
+    vE_rr = np.r_[0.0, np.diff(E_rr)]
+    vE_spo2 = np.r_[0.0, np.diff(E_spo2)]
+
     df = pd.DataFrame({
-        "minute": minutes,
-        "HRV": hrv,
-        "RR": rr,
-        "SpO2": spo2,
-        "bad_hrv": bad_hrv,
-        "bad_rr": bad_rr,
-        "bad_spo2": bad_spo2,
-        "s_mean_active": s,
-        "drift_ewma": drift,
-        "worst_in_window": worst,
+        "min": np.arange(1, n+1),
+        "HRV": hrv, "RR": rr, "SpO2": spo2,
+        "%dHRV": d_hrv, "%dRR": d_rr, "%dSpO2": d_spo2,
+        "bad_HRV": bad_hrv, "bad_RR": bad_rr, "bad_SpO2": bad_spo2,
+        "active_systems": active,
+        "dn_step(mean_active,gated)": dn_step,
+        "dn_worst(window)": dn_worst,
+        "dn_ewma(drift)": dn_ewma,
+        "DN_final": dn_final,
+        "label": labels,
         "shock": shock,
-        "label": label
+        "T_hrv": T_hrv, "T_rr": T_rr, "T_spo2": T_spo2,
+        "E_hrv": E_hrv, "E_rr": E_rr, "E_spo2": E_spo2,
+        "vT_hrv": vT_hrv, "vT_rr": vT_rr, "vT_spo2": vT_spo2,
+        "vE_hrv": vE_hrv, "vE_rr": vE_rr, "vE_spo2": vE_spo2,
     })
-    return df
 
+    return dn_step, dn_worst, dn_ewma, dn_final, labels, red_minutes, warn_minutes, shock_minutes, df
 
-def minutes_of(df: pd.DataFrame, target: str) -> List[int]:
-    if df.empty:
-        return []
-    return df.loc[df["label"] == target, "minute"].astype(int).tolist()
+def build_dn_plot(dn_final, labels, thr_warn, thr_red, title="DN dynamic (parallel: drift + worst)"):
+    n = len(dn_final)
+    x = np.arange(1, n+1)
 
+    # marker colors
+    colors = []
+    for lb in labels:
+        if lb == "RED":
+            colors.append("#d62728")
+        elif lb == "WARNING":
+            colors.append("#ff7f0e")
+        else:
+            colors.append("#2ca02c")
 
-# =========================
-# Plot
-# =========================
-def plot_dn(df: pd.DataFrame, cfg: DNConfig, upto: Optional[int] = None):
-    if df.empty:
-        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=dn_final,
+        mode="lines+markers",
+        marker=dict(size=9, color=colors),
+        line=dict(width=2),
+        name="DN"
+    ))
 
-    d = df.copy()
-    if upto is not None:
-        d = d.iloc[:upto].copy()
+    # Threshold lines
+    fig.add_hline(y=thr_red, line_dash="dash", opacity=0.5)
+    fig.add_hline(y=thr_warn, line_dash="dash", opacity=0.5)
 
-    x = d["minute"].to_numpy()
-    y = d["worst_in_window"].to_numpy()
-
-    fig = plt.figure(figsize=(7.2, 3.8))
-    plt.plot(x, y, marker="o", linewidth=1.8)
-
-    # Mark RED/WARNING points
-    for _, row in d.iterrows():
-        if row["label"] == "RED":
-            plt.scatter(row["minute"], row["worst_in_window"], s=50)
-        elif row["label"] == "WARNING":
-            plt.scatter(row["minute"], row["worst_in_window"], s=35)
-
-    plt.axhline(cfg.WARN_THR, linestyle="--", linewidth=1.2)
-    plt.axhline(cfg.RED_THR, linestyle="--", linewidth=1.2)
-
-    plt.title(f"DN dynamic — Worst-in-window (W={cfg.WORST_WINDOW} min)  |  EWMA α={cfg.ALPHA}")
-    plt.xlabel("Time (minute index)")
-    plt.ylabel("DN (0–1)")
-    plt.xticks(np.arange(1, int(d["minute"].max()) + 1, 1))
-    plt.ylim(0, 1.0)
-    plt.grid(True, alpha=0.25)
-    plt.tight_layout()
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (minute index)",
+        yaxis_title="DN (0..1)",
+        yaxis=dict(range=[0, 1.0]),
+        height=430,
+        margin=dict(l=40, r=20, t=55, b=40)
+    )
+    fig.update_xaxes(dtick=1)
     return fig
 
-
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title="DN alert demo", layout="wide")
+# -------------------------
+# UI
+# -------------------------
 st.title("DN alert demo")
-st.caption("DN_dynamic (baseline-free): EWMA drift on mean-active badness + SHOCK step alert (low false alarms).")
+st.caption("DN_dynamic (baseline-free): parallel signals = SHOCK step + DRIFT (EWMA) + Worst-in-window. Designed for low false alarms.")
 
-# Session state for play
+colL, colR = st.columns([1, 1.2], gap="large")
+
+with colL:
+    st.subheader("Input (15 points each)")
+    default_hrv = "45 44 42 35 36 32 30 31 32 35 38 40 42 43 45"
+    default_rr = "14 14 15 15 16 16 17 18 19 16 17 18 19 20 21"
+    default_spo2 = "98 97 92 97 95 94 94 92 93 94 95 96 97 98 99"
+
+    hrv_txt = st.text_area("HRV (ms)", value=default_hrv, height=80)
+    rr_txt = st.text_area("RR (breaths/min)", value=default_rr, height=80)
+    spo2_txt = st.text_area("SpO₂ (%)", value=default_spo2, height=80)
+
+    with st.expander("Settings (hidden by default)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            w = st.selectbox("Worst-in-window (minutes)", [3, 5], index=0)
+            alpha = st.slider("EWMA alpha (drift smoothing)", 0.50, 0.90, 0.75, 0.05)
+            min_sys = st.selectbox("Min active systems (anti false alarm)", [1, 2, 3], index=1)
+        with c2:
+            thr_warn = st.slider("WARNING threshold (DN)", 0.10, 0.40, 0.22, 0.01)
+            thr_red = st.slider("RED threshold (DN)", 0.20, 0.70, 0.35, 0.01)
+            shock_thr = st.slider("SHOCK threshold (max badness)", 0.20, 0.80, 0.35, 0.01)
+
+        st.markdown("**Normalization constants (fixed DN cores):**")
+        K_hrv = st.number_input("K_hrv", value=80.0, step=1.0)
+        K_rr = st.number_input("K_rr", value=25.0, step=1.0)
+        K_spo2 = st.number_input("K_spo2", value=5.0, step=0.5)
+
+    run_static = st.button("Run static", use_container_width=True)
+    play = st.button("Play (3s/step)", use_container_width=True)
+    stop = st.button("Stop", use_container_width=True)
+
+with colR:
+    st.subheader("Output")
+
+# Playback state
 if "playing" not in st.session_state:
     st.session_state.playing = False
 if "play_idx" not in st.session_state:
-    st.session_state.play_idx = 2  # start showing from minute 2
-if "last_df" not in st.session_state:
-    st.session_state.last_df = pd.DataFrame()
+    st.session_state.play_idx = 1
 
-left, right = st.columns([1, 1])
-
-with left:
-    st.subheader("Input (15 points each)")
-
-    default_hrv = "45 44 42 35 36 32 30 28 27 22 24 23 21 20 19"
-    default_rr = "14 14 15 15 16 16 17 18 19 20 21 22 23 24 25"
-    default_spo2 = "98 97 92 97 95 94 94 92 93 89 90 91 90 89 89"
-
-    hrv_txt = st.text_area("HRV (ms)", value=default_hrv, height=70)
-    rr_txt = st.text_area("RR (breaths/min)", value=default_rr, height=70)
-    spo2_txt = st.text_area("SpO₂ (%)", value=default_spo2, height=70)
-
-    # Keep it simple: only window selector (you asked W=3/5; default 5 for safety)
-    cfg_window = st.selectbox("Worst-in-window (minutes)", options=[3, 5], index=1)
-    CFG.WORST_WINDOW = int(cfg_window)
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        run_static = st.button("Run static", use_container_width=True)
-    with c2:
-        play_btn = st.button("Play (3s/step)", use_container_width=True)
-    with c3:
-        stop_btn = st.button("Stop", use_container_width=True)
-
-# Controls
-if stop_btn:
+if stop:
     st.session_state.playing = False
-    st.session_state.play_idx = 2
+    st.session_state.play_idx = 1
 
-if play_btn:
-    st.session_state.playing = True
-    st.session_state.play_idx = 2
+# Parse inputs
+hrv = parse_series(hrv_txt)
+rr = parse_series(rr_txt)
+spo2 = parse_series(spo2_txt)
 
-# Parse + compute
-hrv = parse_series(hrv_txt, n=15)
-rr = parse_series(rr_txt, n=15)
-spo2 = parse_series(spo2_txt, n=15)
+ok = (len(hrv) == len(rr) == len(spo2) == 15)
 
-df = pd.DataFrame()
-if len(hrv) == 15 and len(rr) == 15 and len(spo2) == 15:
-    df = compute_dn(hrv, rr, spo2, CFG)
-    st.session_state.last_df = df
-else:
-    # Use last df if user is editing during play
-    if not st.session_state.last_df.empty:
-        df = st.session_state.last_df.copy()
+if not ok:
+    with colR:
+        st.error("Bạn phải nhập đúng **15 số** cho mỗi dãy (HRV, RR, SpO₂).")
+    st.stop()
 
-with right:
-    if df.empty:
-        st.warning("Please input exactly 15 numbers for each series (HRV, RR, SpO₂).")
+# Compute DN for full series once
+dn_step, dn_worst, dn_ewma, dn_final, labels, red_minutes, warn_minutes, shock_minutes, df = compute_dn_dynamic(
+    hrv, rr, spo2,
+    K_hrv=K_hrv, K_rr=K_rr, K_spo2=K_spo2,
+    w=w, alpha=alpha,
+    thr_warn=thr_warn, thr_red=thr_red,
+    shock_thr=shock_thr,
+    min_systems_for_alert=min_sys
+)
+
+def render(min_upto: int):
+    # slice to minute
+    dn_slice = dn_final[:min_upto]
+    labels_slice = labels[:min_upto]
+
+    # per-minute label text
+    red_m = [m for m in red_minutes if m <= min_upto]
+    warn_m = [m for m in warn_minutes if m <= min_upto]
+    shock_m = [m for m in shock_minutes if m <= min_upto]
+
+    # Overall status at current minute
+    current_label = labels[min_upto - 1]
+    if current_label == "RED":
+        st.error(f"🔴 RED (minute {min_upto})")
+    elif current_label == "WARNING":
+        st.warning(f"🟠 WARNING (minute {min_upto})")
     else:
-        # Determine which part to show
-        if st.session_state.playing:
-            upto = st.session_state.play_idx
-        else:
-            upto = None
+        st.success(f"🟢 STABLE (minute {min_upto})")
 
-        # Summary: minutes list (per-minute, not whole-chain)
-        red_minutes = minutes_of(df.iloc[:upto] if upto else df, "RED")
-        warn_minutes = minutes_of(df.iloc[:upto] if upto else df, "WARNING")
+    st.markdown(
+        f"**RED minutes:** {red_m if red_m else 'None'}  \n"
+        f"**WARNING minutes:** {warn_m if warn_m else 'None'}  \n"
+        f"**SHOCK minutes (step events):** {shock_m if shock_m else 'None'}"
+    )
 
-        # Status banner (based on latest shown minute)
-        shown = df.iloc[:upto] if upto else df
-        latest_label = shown.iloc[-1]["label"]
-        if latest_label == "RED":
-            st.error(f"RED (minute {int(shown.iloc[-1]['minute'])})")
-        elif latest_label == "WARNING":
-            st.warning(f"WARNING (minute {int(shown.iloc[-1]['minute'])})")
-        else:
-            st.success(f"STABLE (minute {int(shown.iloc[-1]['minute'])})")
+    fig = build_dn_plot(
+        dn_final, labels,
+        thr_warn=thr_warn, thr_red=thr_red,
+        title=f"DN dynamic — parallel (Worst-in-window={w}m, EWMA α={alpha:.2f})"
+    )
+    # show full plot but it's okay; minute focus is from labels list above
+    st.plotly_chart(fig, use_container_width=True)
 
-        # Explicit per-minute conclusion
-        st.write(f"**RED minutes:** {', '.join(map(str, red_minutes)) if red_minutes else 'None'}")
-        st.write(f"**WARNING minutes:** {', '.join(map(str, warn_minutes)) if warn_minutes else 'None'}")
+    with st.expander("Details (per minute: %Δ, T/E, vT/vE, badness, DN parts)", expanded=False):
+        st.dataframe(df, use_container_width=True, height=320)
 
-        fig = plot_dn(df, CFG, upto=upto)
-        st.pyplot(fig, clear_figure=True)
+with colR:
+    placeholder = st.empty()
 
-        with st.expander("Details (per minute: badness → s → drift → worst → label)"):
-            cols = ["minute", "bad_hrv", "bad_rr", "bad_spo2", "s_mean_active",
-                    "drift_ewma", "worst_in_window", "shock", "label"]
-            st.dataframe(shown[cols].style.format({
-                "bad_hrv": "{:.2f}", "bad_rr": "{:.2f}", "bad_spo2": "{:.2f}",
-                "s_mean_active": "{:.2f}", "drift_ewma": "{:.2f}", "worst_in_window": "{:.2f}"
-            }), use_container_width=True)
+# Run static
+if run_static:
+    with colR:
+        placeholder.container()
+        render(15)
 
-# Play loop
-if st.session_state.playing and not df.empty:
-    # Advance 1 step each 3 seconds until minute 15
-    time.sleep(3)
-    st.session_state.play_idx += 1
-    if st.session_state.play_idx > 15:
+# Play simulation (blocking loop but simplest & stable)
+if play:
+    st.session_state.playing = True
+    st.session_state.play_idx = 1
+
+if st.session_state.playing and not stop:
+    with colR:
+        for i in range(st.session_state.play_idx, 16):
+            placeholder.container()
+            render(i)
+            st.session_state.play_idx = i + 1
+            time.sleep(3)
         st.session_state.playing = False
-        st.session_state.play_idx = 2
-    st.rerun()
+        st.session_state.play_idx = 1
+
+# Default first view
+if (not run_static) and (not play) and (not st.session_state.playing):
+    with colR:
+        placeholder.container()
+        render(15)

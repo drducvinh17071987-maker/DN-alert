@@ -1,351 +1,245 @@
-import streamlit as st
+import time
 import numpy as np
-import pandas as pd
+import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
 
-st.set_page_config(page_title="DN Alerts – HRV / SpO₂ / RR", layout="wide")
+# =========================
+# DN DYNAMIC PARAMETERS (CHỐT)
+# =========================
+K_HRV = 80
+K_RR = 25
+K_SPO2 = 5
+N_POINTS = 30
+STEP_SECONDS = 3  # Play: 3 seconds per step
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
-def parse_series(text: str):
-    if not text or not text.strip():
-        return []
-    cleaned = text.replace(",", " ").replace("\n", " ").replace("\t", " ")
-    parts = [p for p in cleaned.split(" ") if p.strip() != ""]
-    out = []
-    for p in parts:
-        try:
-            out.append(float(p))
-        except:
-            pass
-    return out
-
-def normalize_len(raw, n=50):
-    if len(raw) == 0:
-        return []
-    if len(raw) < n:
-        raw = raw + [raw[-1]] * (n - len(raw))
-    if len(raw) > n:
-        raw = raw[:n]
-    return raw
-
-def make_time_index(n=50):
-    start = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=n-1)
-    return [start + timedelta(minutes=i) for i in range(n)]
-
-def demo_series(signal="HRV", n=50, seed=7):
-    rng = np.random.default_rng(seed)
-    if signal == "HRV":
-        base = 38 + rng.normal(0, 1.2, n).cumsum() * 0.05
-        base = np.clip(base, 10, 160)
-        base[18] += 14; base[19] -= 12
-        base[34:40] -= np.linspace(0, 10, 6)
-        return base.tolist()
-    if signal == "SpO₂":
-        base = 97 + rng.normal(0, 0.25, n)
-        base[12] = 92; base[13] = 97   # drop + rebound (false alarm-like)
-        base[32:50] -= np.linspace(0, 7, 18)
-        return np.clip(base, 82, 100).tolist()
-    if signal == "RR":
-        base = 16 + rng.normal(0, 0.35, n)
-        base[20:28] += np.linspace(0, 6, 8)
-        base[28:35] += 4
-        return np.clip(base, 8, 40).tolist()
-    return rng.normal(0, 1, n).tolist()
-
-# -----------------------------
-# Config: “chuẩn cảnh báo” (gọn, ít tham số)
-# - HRV, SpO2: tụt (down) là xấu
-# - RR: tăng (up) là xấu
-# Logic chính: rolling total % over WINDOW + ngưỡng thô (raw)
-# -----------------------------
-CFG = {
-    "HRV": dict(
-        window=10,                 # 10 phút
-        warn_total=-25.0,          # tổng tụt ≤ -25% -> WARNING
-        red_total=-40.0,           # tổng tụt ≤ -40% -> RED
-        raw_warn=28.0,             # HRV thô thấp -> WARNING
-        raw_red=24.0,              # HRV thô rất thấp -> RED
-        noise_up_pct=70.0,         # step tăng quá nhanh -> noise brake
-        noise_abs_jump=60.0,       # jump ms lớn -> noise brake
-        direction="down_bad",
-        naive_step=-20.0           # naive đỏ nếu step ≤ -20%
-    ),
-    "SpO₂": dict(
-        window=10,
-        warn_total=-3.0,           # tổng tụt % theo SpO2 là nhỏ (vd 97->94 ~ -3.1%)
-        red_total=-6.0,
-        raw_warn=92.0,
-        raw_red=89.0,
-        noise_up_pct=3.0,          # SpO2 tăng step >3% thường là artefact
-        noise_abs_jump=None,
-        direction="down_bad",
-        naive_step=-2.0
-    ),
-    "RR": dict(
-        window=10,
-        warn_total=18.0,           # RR tăng tổng ≥ +18% -> WARNING
-        red_total=30.0,            # RR tăng tổng ≥ +30% -> RED
-        raw_warn=22.0,
-        raw_red=28.0,
-        noise_up_pct=80.0,
-        noise_abs_jump=None,
-        direction="up_bad",
-        naive_step=20.0            # naive đỏ nếu step ≥ +20%
-    )
-}
-
-# -----------------------------
-# DN engine (window kinetics + raw thresholds + noise brake + V-shape)
-# -----------------------------
-def dn_engine(raw, signal_name):
-    cfg = CFG[signal_name]
-    x = np.array(raw, dtype=float)
-    n = len(x)
-    t = make_time_index(n)
-
-    # step %
-    pct_step = np.zeros(n, dtype=float)
-    pct_step[1:] = 100.0 * (x[1:] - x[:-1]) / np.clip(x[:-1], 1e-9, None)
-
-    # rolling total % over window (i - W)
-    W = int(cfg["window"])
-    total_pct = np.zeros(n, dtype=float)
-    for i in range(n):
-        j = i - W
-        if j >= 0:
-            total_pct[i] = 100.0 * (x[i] - x[j]) / np.clip(x[j], 1e-9, None)
-        else:
-            total_pct[i] = 0.0
-
-    # naive (to show “báo loạn”)
-    if cfg["direction"] == "down_bad":
-        naive_alert = (pct_step <= cfg["naive_step"])
+# =========================
+def _rerun():
+    # Streamlit version compatibility
+    if hasattr(st, "rerun"):
+        st.rerun()
     else:
-        naive_alert = (pct_step >= cfg["naive_step"])
+        st.experimental_rerun()
 
-    # noise brake
-    noise = np.zeros(n, dtype=bool)
-    noise |= (pct_step >= cfg["noise_up_pct"])
-    if cfg["noise_abs_jump"] is not None:
-        abs_jump = np.zeros(n, dtype=float)
-        abs_jump[1:] = np.abs(x[1:] - x[:-1])
-        noise |= (abs_jump >= float(cfg["noise_abs_jump"]))
+def parse_series(txt: str):
+    vals = [v for v in txt.replace(",", " ").split() if v.strip() != ""]
+    return list(map(float, vals))
 
-    # V-shape recovery (đơn giản): 1 bước tụt mạnh + 1 bước hồi mạnh
-    vshape = np.zeros(n, dtype=bool)
-    for i in range(2, n):
-        if cfg["direction"] == "down_bad":
-            if (pct_step[i-1] <= -20.0) and (pct_step[i] >= +15.0):
-                vshape[i] = True
+def pct_change(x):
+    x = np.array(x, dtype=float)
+    pct = np.zeros(len(x))
+    for i in range(1, len(x)):
+        if x[i - 1] != 0:
+            pct[i] = 100 * (x[i] - x[i - 1]) / x[i - 1]
+    return pct
+
+def dn_dynamic(hrv, rr, spo2):
+    """
+    DN_dynamic (baseline-free):
+    - Compute |%Δ| for each signal
+    - Normalize by K: HRV/80, RR/25, SpO2/5
+    - Filter false alarms: activate only if >=2 systems exceed T>0.25
+    """
+    hrv = np.array(hrv, dtype=float)
+    rr = np.array(rr, dtype=float)
+    spo2 = np.array(spo2, dtype=float)
+
+    T_hrv = np.abs(pct_change(hrv)) / K_HRV
+    T_rr = np.abs(pct_change(rr)) / K_RR
+    T_spo2 = np.abs(pct_change(spo2)) / K_SPO2
+
+    dn = np.zeros(len(hrv))
+    for i in range(len(hrv)):
+        active = sum([
+            T_hrv[i] > 0.25,
+            T_rr[i] > 0.25,
+            T_spo2[i] > 0.25
+        ])
+        dn[i] = max(T_hrv[i], T_rr[i], T_spo2[i]) if active >= 2 else 0.0
+
+    return dn
+
+def dn_state(dn):
+    """
+    Demo thresholds (for visualization only):
+    - GREEN: < 0.35
+    - AMBER: 0.35–0.6
+    - RED: >= 0.6
+    """
+    states = []
+    for v in dn:
+        if v >= 0.6:
+            states.append("RED")
+        elif v >= 0.35:
+            states.append("AMBER")
         else:
-            if (pct_step[i-1] >= +20.0) and (pct_step[i] <= -15.0):
-                vshape[i] = True
+            states.append("GREEN")
+    return states
 
-    alert = np.array(["GREEN"] * n, dtype=object)
-    tag = np.array([""] * n, dtype=object)
+def render_status_box(state_now: str):
+    if state_now == "RED":
+        st.error("🔴 PRE-FAILURE ALERT")
+        st.caption("Multi-system reserve acceleration detected (DN_dynamic).")
+    elif state_now == "AMBER":
+        st.warning("🟡 MONITOR CLOSELY")
+        st.caption("Reserve is accelerating—watch closely (DN_dynamic).")
+    else:
+        st.success("🟢 STABLE")
+        st.caption("No significant multi-system reserve acceleration detected.")
 
-    for i in range(n):
-        if i == 0:
-            alert[i] = "GREEN"; tag[i] = "baseline"; continue
+def dn_plot(dn, states, upto_idx):
+    # upto_idx is inclusive count of points to show (1..N_POINTS)
+    dn_show = dn[:upto_idx]
+    states_show = states[:upto_idx]
 
-        if noise[i]:
-            alert[i] = "INFO"; tag[i] = "noise_brake"; continue
-
-        if vshape[i]:
-            alert[i] = "INFO"; tag[i] = "V_recovery"; continue
-
-        # raw thresholds (fast safety)
-        if cfg["direction"] == "down_bad":
-            if x[i] <= cfg["raw_red"]:
-                alert[i] = "RED"; tag[i] = "raw_low"; continue
-            if x[i] <= cfg["raw_warn"]:
-                alert[i] = "WARNING"; tag[i] = "raw_low"; continue
-        else:
-            if x[i] >= cfg["raw_red"]:
-                alert[i] = "RED"; tag[i] = "raw_high"; continue
-            if x[i] >= cfg["raw_warn"]:
-                alert[i] = "WARNING"; tag[i] = "raw_high"; continue
-
-        # kinetics (window total)
-        if cfg["direction"] == "down_bad":
-            if total_pct[i] <= cfg["red_total"]:
-                alert[i] = "RED"; tag[i] = f"total_{W}"; continue
-            if total_pct[i] <= cfg["warn_total"]:
-                alert[i] = "WARNING"; tag[i] = f"total_{W}"; continue
-        else:
-            if total_pct[i] >= cfg["red_total"]:
-                alert[i] = "RED"; tag[i] = f"total_{W}"; continue
-            if total_pct[i] >= cfg["warn_total"]:
-                alert[i] = "WARNING"; tag[i] = f"total_{W}"; continue
-
-        alert[i] = "GREEN"; tag[i] = "stable"
-
-    df = pd.DataFrame({
-        "time": t,
-        "raw": x,
-        "pct_step": pct_step,
-        "total_pct_window": total_pct,
-        "alert": alert,
-        "tag": tag,
-        "naive_alert": naive_alert
-    })
-    df.insert(0, "signal", signal_name)
-    return df
-
-def segments(df):
-    segs = []
-    start = 0
-    for i in range(1, len(df)):
-        if df.loc[i, "alert"] != df.loc[i-1, "alert"]:
-            segs.append((df.loc[start, "time"], df.loc[i-1, "time"], df.loc[start, "alert"]))
-            start = i
-    segs.append((df.loc[start, "time"], df.loc[len(df)-1, "time"], df.loc[start, "alert"]))
-    return pd.DataFrame(segs, columns=["start", "end", "alert"])
-
-def add_alert_bands(fig, seg_df, y0, y1):
-    band_color = {
-        "GREEN": "rgba(0, 200, 0, 0.10)",
-        "INFO": "rgba(0, 160, 255, 0.12)",
-        "WARNING": "rgba(255, 180, 0, 0.14)",
-        "RED": "rgba(255, 0, 0, 0.18)",
-    }
-    for _, r in seg_df.iterrows():
-        fig.add_shape(
-            type="rect",
-            xref="x", yref="y",
-            x0=r["start"], x1=r["end"],
-            y0=y0, y1=y1,
-            fillcolor=band_color.get(r["alert"], "rgba(0,0,0,0.08)"),
-            line_width=0,
-            layer="below"
-        )
-
-def plot_raw_with_dn_and_naive(df, title):
-    t = df["time"]
-    y = df["raw"]
-
-    y_min = float(np.min(y))
-    y_max = float(np.max(y))
-    pad = (y_max - y_min) * 0.18 if y_max > y_min else 1.0
-    y0, y1 = y_min - pad, y_max + pad
+    color_map = {"GREEN": "#2ecc71", "AMBER": "#f1c40f", "RED": "#e74c3c"}
+    colors = [color_map[s] for s in states_show]
 
     fig = go.Figure()
-    seg = segments(df)
-    add_alert_bands(fig, seg, y0, y1)
-
-    fig.add_trace(go.Scatter(x=t, y=y, mode="lines+markers", name="Raw"))
-
-    mask = df["naive_alert"].values.astype(bool)
     fig.add_trace(go.Scatter(
-        x=t[mask],
-        y=y[mask],
-        mode="markers",
-        name="Naive alert (red dots)",
-        marker=dict(color="red", size=10, symbol="x")
+        x=list(range(1, upto_idx + 1)),
+        y=dn_show,
+        mode="lines+markers",
+        marker=dict(color=colors, size=9),
+        line=dict(color="gray", width=2)
     ))
 
+    # reference lines (optional but helpful)
+    fig.add_hline(y=0.35, line_dash="dot", line_color="gray")
+    fig.add_hline(y=0.6, line_dash="dot", line_color="gray")
+
     fig.update_layout(
-        title=title,
-        height=520,
-        margin=dict(l=10, r=10, t=50, b=10),
-        xaxis_title="time",
-        yaxis_title="raw",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        height=380,
+        margin=dict(l=20, r=20, t=30, b=20),
+        xaxis_title="Time (minute index)",
+        yaxis_title="DN_dynamic intensity",
+        showlegend=False
     )
-    fig.update_yaxes(range=[y0, y1])
     return fig
 
-# -----------------------------
-# UI (2 columns, no "Parameters" block)
-# -----------------------------
-st.title("DN Alerts – HRV / SpO₂ / RR (50×1min)")
-st.caption("Cột trái nhập số + Run. Cột phải hiển thị đồ thị (DN bands + naive red dots).")
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(layout="wide")
+st.title("DN Prognostic Signal Demo")
+st.caption("DN_dynamic (baseline-free) · HRV · RR · SpO₂ · false-alarm filtering (≥2 systems)")
 
-tabs = st.tabs(["HRV", "SpO₂", "RR"])
+# session state init
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+if "play_idx" not in st.session_state:
+    st.session_state.play_idx = 1
 
-def render_tab(signal):
-    left, right = st.columns([1, 2], gap="large")
+left, right = st.columns([1, 1.3])
 
-    cfg = CFG[signal]
+with left:
+    st.subheader("Input (30 points each)")
 
-    with left:
-        st.subheader(f"{signal} input")
+    hrv_txt = st.text_area(
+        "HRV (ms)",
+        "45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 "
+        "29 28 27 26 25 24 23 22 21 20 19 18 17 16"
+    )
+    rr_txt = st.text_area(
+        "RR (breaths/min)",
+        "14 14 14 15 15 16 16 17 18 18 19 19 20 20 21 "
+        "21 22 22 23 23 24 24 25 26 26 27 27 28 28 29"
+    )
+    spo2_txt = st.text_area(
+        "SpO₂ (%)",
+        "98 98 98 97 97 96 96 95 95 94 94 93 93 92 92 "
+        "91 91 90 90 89 89 88 88 87 87 86 86 85 85 84"
+    )
 
-        if signal == "HRV":
-            default_text = "45 44 42 35 36 32 30 28 27 22"
-        elif signal == "SpO₂":
-            default_text = "98 97 92 97 95 94 94 92 93 89"
-        else:
-            default_text = "16 16 17 18 20 22 24 24 23 22"
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        static_btn = st.button("Run static analysis")
+    with c2:
+        play_btn = st.button("▶ Play simulation (3s)")
+    with c3:
+        stop_btn = st.button("Stop")
 
-        text = st.text_area("Paste values (space-separated)", value=default_text, height=120)
+    st.divider()
+    st.caption(f"Chốt K: HRV={K_HRV}, RR={K_RR}, SpO₂={K_SPO2}.  |  Input: {N_POINTS} points.  |  Play: {STEP_SECONDS}s/step")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            use_demo = st.checkbox("Use demo 50 points", value=False)
-        with c2:
-            seed = st.number_input("Demo seed", 0, 9999, 7, 1)
+# Parse + validate once (used by both modes)
+try:
+    hrv_all = parse_series(hrv_txt)
+    rr_all = parse_series(rr_txt)
+    spo2_all = parse_series(spo2_txt)
+except Exception:
+    hrv_all, rr_all, spo2_all = None, None, None
 
-        run = st.button("Run", type="primary")
+def validate_and_trim():
+    if hrv_all is None or rr_all is None or spo2_all is None:
+        return None, None, None, "Input format error: please use numbers separated by spaces."
 
-        st.markdown("**Current alert rules (fixed):**")
-        if cfg["direction"] == "down_bad":
-            st.write(f"- **RED** if raw ≤ {cfg['raw_red']} OR total({cfg['window']}m) ≤ {cfg['red_total']}%")
-            st.write(f"- **WARNING** if raw ≤ {cfg['raw_warn']} OR total({cfg['window']}m) ≤ {cfg['warn_total']}%")
-        else:
-            st.write(f"- **RED** if raw ≥ {cfg['raw_red']} OR total({cfg['window']}m) ≥ {cfg['red_total']}%")
-            st.write(f"- **WARNING** if raw ≥ {cfg['raw_warn']} OR total({cfg['window']}m) ≥ {cfg['warn_total']}%")
-        st.write(f"- **INFO** noise_brake if step% ≥ {cfg['noise_up_pct']} (or big jump), or V-recovery")
-        st.write(f"- **Naive red dots**: step% threshold = {cfg['naive_step']} ({'≤' if cfg['direction']=='down_bad' else '≥'})")
+    if len(hrv_all) < N_POINTS or len(rr_all) < N_POINTS or len(spo2_all) < N_POINTS:
+        return None, None, None, "Please provide at least 30 values for EACH signal."
 
-    if not run:
-        with right:
-            st.info("Nhập dữ liệu rồi bấm **Run**.")
-        return
+    hrv = hrv_all[:N_POINTS]
+    rr = rr_all[:N_POINTS]
+    spo2 = spo2_all[:N_POINTS]
+    return hrv, rr, spo2, None
 
-    # build series
-    if use_demo:
-        raw = demo_series(signal, 50, int(seed))
+# Control buttons
+if stop_btn:
+    st.session_state.playing = False
+    st.session_state.play_idx = 1
+
+if play_btn:
+    st.session_state.playing = True
+    st.session_state.play_idx = 1
+
+# Right side rendering
+with right:
+    # placeholders so UI doesn't jump
+    status_box = st.container()
+    chart_box = st.empty()
+
+    hrv, rr, spo2, err = validate_and_trim()
+
+    if err:
+        st.error(err)
+
     else:
-        raw = normalize_len(parse_series(text), 50)
+        dn = dn_dynamic(hrv, rr, spo2)
+        states = dn_state(dn)
 
-    if len(raw) == 0:
-        with right:
-            st.error("Không đọc được số nào. Bạn dán lại chuỗi số (cách nhau bởi space/comma).")
-        return
+        # STATIC MODE
+        if static_btn and not st.session_state.playing:
+            state_now = states[-1]
+            with status_box:
+                render_status_box(state_now)
 
-    df = dn_engine(raw, signal)
+            fig = dn_plot(dn, states, upto_idx=N_POINTS)
+            chart_box.plotly_chart(fig, use_container_width=True)
 
-    # summary metrics
-    counts = df["alert"].value_counts().reindex(["GREEN", "INFO", "WARNING", "RED"]).fillna(0).astype(int)
-    with right:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("GREEN", int(counts["GREEN"]))
-        m2.metric("INFO", int(counts["INFO"]))
-        m3.metric("WARNING", int(counts["WARNING"]))
-        m4.metric("RED", int(counts["RED"]))
+        # PLAY MODE (pseudo-streaming)
+        elif st.session_state.playing:
+            idx = int(st.session_state.play_idx)
+            idx = max(1, min(idx, N_POINTS))
 
-        st.plotly_chart(plot_raw_with_dn_and_naive(df, f"{signal}: Raw + DN bands + naive red dots"), use_container_width=True)
+            state_now = states[idx - 1]
+            with status_box:
+                render_status_box(state_now)
 
-    # tables (below, still gọn)
-    st.markdown("### Table")
-    show = df.copy()
-    for col in ["raw", "pct_step", "total_pct_window"]:
-        show[col] = show[col].astype(float).round(4)
-    st.dataframe(show, use_container_width=True, height=420)
+            fig = dn_plot(dn, states, upto_idx=idx)
+            chart_box.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Segments")
-    st.dataframe(segments(df), use_container_width=True)
+            # advance
+            if idx >= N_POINTS:
+                st.session_state.playing = False
+                st.session_state.play_idx = 1
+            else:
+                time.sleep(STEP_SECONDS)
+                st.session_state.play_idx = idx + 1
+                _rerun()
 
-    csv = show.to_csv(index=False).encode("utf-8")
-    st.download_button(f"Download {signal} CSV", data=csv, file_name=f"DN_{signal}_50points.csv", mime="text/csv")
-
-with tabs[0]:
-    render_tab("HRV")
-with tabs[1]:
-    render_tab("SpO₂")
-with tabs[2]:
-    render_tab("RR")
+        # DEFAULT VIEW (when nothing pressed yet)
+        else:
+            st.info("Press **Run static analysis** (final view) or **Play simulation (3s)** (streaming view).")
+            # show an empty/initial chart with first point for orientation
+            fig = dn_plot(dn, states, upto_idx=1)
+            chart_box.plotly_chart(fig, use_container_width=True)

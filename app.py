@@ -5,362 +5,312 @@ import streamlit as st
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="DN alert demo", layout="wide")
+st.title("DN alert demo")
+st.caption("Gatekeeper: DN RED if ≥2 systems are RED; DN WARNING if ≥2 systems are WARNING/RED. Runs only on button clicks.")
 
-# -------------------------
-# Helpers
-# -------------------------
-def parse_series(text: str) -> list[float]:
-    if not text.strip():
+# ----------------------------
+# Utils
+# ----------------------------
+def parse_15(text: str):
+    text = text.replace(",", " ").replace("\n", " ").strip()
+    if not text:
         return []
-    parts = text.replace(",", " ").split()
-    out = []
-    for p in parts:
+    vals = []
+    for p in text.split():
         try:
-            out.append(float(p))
+            vals.append(float(p))
         except:
             pass
-    return out
+    return vals[:15]
 
-def pct_change(x: np.ndarray) -> np.ndarray:
-    """
-    %Δ between consecutive points: 100*(x[i]-x[i-1])/x[i-1], first = 0.
-    """
-    x = np.asarray(x, dtype=float)
-    out = np.zeros_like(x, dtype=float)
-    for i in range(1, len(x)):
-        denom = x[i-1]
-        if denom == 0:
-            out[i] = 0.0
-        else:
-            out[i] = 100.0 * (x[i] - x[i-1]) / denom
-    return out
+def pct_change(prev, cur):
+    if prev == 0:
+        return 0.0
+    return 100.0 * (cur - prev) / prev
 
-def clamp01(a):
-    return np.minimum(1.0, np.maximum(0.0, a))
+def color_map(label):
+    if label == "RED":
+        return "#d62728"
+    if label == "WARNING":
+        return "#ffbf00"
+    if label == "INFO":
+        return "#1f77b4"
+    return "#2ca02c"  # GREEN
 
-def ewma(series: np.ndarray, alpha: float) -> np.ndarray:
-    """
-    EWMA smoothing: y[t]=alpha*y[t-1]+(1-alpha)*x[t]
-    """
-    x = np.asarray(series, dtype=float)
-    y = np.zeros_like(x, dtype=float)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = alpha * y[i-1] + (1 - alpha) * x[i]
-    return y
+def dn_gatekeeper(hrv_label, rr_label, spo2_label):
+    # INFO does NOT count as WARNING/RED; it's used for noise/recovery notes.
+    labels = [hrv_label, rr_label, spo2_label]
+    red_cnt = sum(x == "RED" for x in labels)
+    warn_cnt = sum(x in ("RED", "WARNING") for x in labels)
 
-def classify(dn_value: float, thr_warn: float, thr_red: float) -> str:
-    if dn_value >= thr_red:
+    if red_cnt >= 2:
         return "RED"
-    if dn_value >= thr_warn:
+    if warn_cnt >= 2:
         return "WARNING"
     return "GREEN"
 
-# -------------------------
-# DN core (baseline-free, multi-system)
-# -------------------------
-def compute_dn_dynamic(hrv, rr, spo2,
-                       K_hrv=80.0, K_rr=25.0, K_spo2=5.0,
-                       w=3,
-                       alpha=0.75,
-                       thr_warn=0.22, thr_red=0.35,
-                       shock_thr=0.35,
-                       min_systems_for_alert=2):
+# ----------------------------
+# Per-system rules (your spec)
+# ----------------------------
+K_SPO2 = 5.0
+K_RR = 25.0
+K_HRV = 80.0  # dynamic normalization for %ΔHRV if needed
+
+def spo2_label(prev, cur, next_val=None):
     """
-    DN philosophy:
-    - Only %Δ is input; DN is not thresholding raw values.
-    - Convert each %Δ into a *badness step* (0..1) with proper direction:
-        HRV: drop is bad
-        RR: increase is bad
-        SpO2: drop is bad
-    - Require >=2 systems active to reduce false alarms (default).
-    - Two signals in parallel:
-        (A) SHOCK step alert: sudden multi-system event.
-        (B) DRIFT alert: sustained deterioration captured by EWMA + Worst-in-window.
+    T = ΔSpO2 / 5 (abs drop)
+    |T|>=0.6 RED (~3% drop), |T|>=0.3 WARNING (~1.5% drop)
+    V-shape (drop then immediate recovery) -> INFO
     """
+    drop = max(0.0, prev - cur)           # absolute drop
+    T = drop / K_SPO2
 
-    n = len(hrv)
-    hrv = np.asarray(hrv, dtype=float)
-    rr = np.asarray(rr, dtype=float)
-    spo2 = np.asarray(spo2, dtype=float)
+    # V-shape noise/recovery check (needs next point)
+    if next_val is not None:
+        rec = max(0.0, next_val - cur)    # recovery amount
+        # if it drops then rebounds quickly close to prior level -> INFO
+        if drop >= 2.0 and rec >= 2.0 and abs(next_val - prev) <= 1.0:
+            return "INFO", T
 
-    # %Δ
-    d_hrv = pct_change(hrv)     # negative is bad
-    d_rr = pct_change(rr)       # positive is bad
-    d_spo2 = pct_change(spo2)   # negative is bad
+    if T >= 0.6:
+        return "RED", T
+    if T >= 0.3:
+        return "WARNING", T
+    return "GREEN", T
 
-    # Signed "bad direction" (positive means deterioration)
-    # HRV: drop => -d_hrv
-    # RR : rise => +d_rr
-    # SpO2: drop => -d_spo2
-    bad_hrv = np.maximum(0.0, (-d_hrv) / K_hrv)
-    bad_rr = np.maximum(0.0, ( d_rr) / K_rr)
-    bad_spo2 = np.maximum(0.0, (-d_spo2) / K_spo2)
+def rr_label(prev, cur):
+    """
+    T = %ΔRR / 25
+    T>=1 RED (≥25%/min), T>=0.5 WARNING (~12–15%), T>=0.2 INFO (~5–8%)
+    """
+    d = pct_change(prev, cur)
+    up = max(0.0, d)
+    T = up / K_RR
+    if T >= 1.0:
+        return "RED", T
+    if T >= 0.5:
+        return "WARNING", T
+    if T >= 0.2:
+        return "INFO", T
+    return "GREEN", T
 
-    bad_hrv = clamp01(bad_hrv)
-    bad_rr = clamp01(bad_rr)
-    bad_spo2 = clamp01(bad_spo2)
+def hrv_label(hrv_series, i):
+    """
+    HRV uses *shape*, not absolute value.
+    - Uses %ΔHRV step, vT, V-shape, drift.
+    - Step-drop ≤ -40% => RED (unless immediate V-shape recovery => INFO)
+    - V-shape: d1<=-20% and d2>=+15% and |total|<=12% => INFO (noise/recovery)
+    - Drift: if last 3 steps total_pct <= -15% => WARNING (soft drift)
+    """
+    if i == 0:
+        return "GREEN", 0.0, 0.0, 0.0  # label, d%, T, E
 
-    # Active systems per minute (badness > 0)
-    active = (bad_hrv > 0).astype(int) + (bad_rr > 0).astype(int) + (bad_spo2 > 0).astype(int)
+    prev = hrv_series[i-1]
+    cur = hrv_series[i]
+    d = pct_change(prev, cur)  # %ΔHRV
+    # dynamic T on %ΔHRV (same spirit you used before)
+    T = d / K_HRV
+    E = 1.0 - (T * T)
 
-    # Mean-active fusion (only among active systems), else 0
-    mean_active = np.zeros(n, dtype=float)
-    for i in range(n):
-        vals = []
-        if bad_hrv[i] > 0: vals.append(bad_hrv[i])
-        if bad_rr[i] > 0: vals.append(bad_rr[i])
-        if bad_spo2[i] > 0: vals.append(bad_spo2[i])
-        mean_active[i] = float(np.mean(vals)) if len(vals) > 0 else 0.0
+    # Step-drop RED rule
+    if d <= -40.0:
+        # if immediate rebound next step -> treat as INFO (likely artifact)
+        if i + 1 < len(hrv_series):
+            d2 = pct_change(cur, hrv_series[i+1])
+            total = 100.0 * (hrv_series[i+1] - prev) / prev if prev != 0 else 0.0
+            if d <= -20.0 and d2 >= +15.0 and abs(total) <= 12.0:
+                return "INFO", d, T, E
+        return "RED", d, T, E
 
-    # Multi-system gating (reduce false alarms)
-    dn_step = np.where(active >= min_systems_for_alert, mean_active, 0.0)
+    # V-shape info (classic)
+    if i + 1 < len(hrv_series):
+        d2 = pct_change(cur, hrv_series[i+1])
+        total = 100.0 * (hrv_series[i+1] - prev) / prev if prev != 0 else 0.0
+        if d <= -20.0 and d2 >= +15.0 and abs(total) <= 12.0:
+            return "INFO", d, T, E
 
-    # SHOCK: sudden multi-system spike OR very strong SpO2 drop with at least one support sign
-    shock = np.zeros(n, dtype=int)
-    max_bad = np.maximum.reduce([bad_hrv, bad_rr, bad_spo2])
-    support_for_spo2 = ((bad_rr > 0) | (bad_hrv > 0)).astype(int)
+    # Drift over last 3 steps (soft, low false alarm)
+    if i >= 3:
+        base = hrv_series[i-3]
+        total3 = 100.0 * (cur - base) / base if base != 0 else 0.0
+        if total3 <= -15.0:
+            return "WARNING", d, T, E
 
-    for i in range(n):
-        is_multisys_spike = (active[i] >= min_systems_for_alert) and (max_bad[i] >= shock_thr)
-        is_spo2_critical = (bad_spo2[i] >= 0.60) and (support_for_spo2[i] == 1)  # anti false-alarm
-        shock[i] = 1 if (is_multisys_spike or is_spo2_critical) else 0
+    return "GREEN", d, T, E
 
-    # DRIFT: EWMA on dn_step
-    dn_ewma = ewma(dn_step, alpha=alpha)
-
-    # Worst-in-window on dn_step (rolling max, inclusive)
-    w = int(max(2, w))
-    dn_worst = np.zeros(n, dtype=float)
-    for i in range(n):
-        lo = max(0, i - (w - 1))
-        dn_worst[i] = float(np.max(dn_step[lo:i+1]))
-
-    # Final DN = max(parallel signals)
-    dn_final = np.maximum(dn_ewma, dn_worst)
-
-    # Labels per minute
-    labels = [classify(dn_final[i], thr_warn, thr_red) for i in range(n)]
-
-    # Minutes lists (1-indexed minutes)
-    red_minutes = [i+1 for i, lb in enumerate(labels) if lb == "RED"]
-    warn_minutes = [i+1 for i, lb in enumerate(labels) if lb == "WARNING"]
-
-    # Also show shock minutes explicitly (can be RED even if drift low)
-    shock_minutes = [i+1 for i in range(n) if shock[i] == 1]
-
-    # Compute "T/E" per system for vt/ve visualization (DN spirit: dynamics)
-    # Here T_dyn = signed deterioration (not absolute):
-    T_hrv = (-d_hrv) / K_hrv
-    T_rr = ( d_rr) / K_rr
-    T_spo2 = (-d_spo2) / K_spo2
-
-    # Lorentz-like E (for visualization only)
-    E_hrv = 1.0 - np.square(T_hrv)
-    E_rr = 1.0 - np.square(T_rr)
-    E_spo2 = 1.0 - np.square(T_spo2)
-
-    vT_hrv = np.r_[0.0, np.diff(T_hrv)]
-    vT_rr = np.r_[0.0, np.diff(T_rr)]
-    vT_spo2 = np.r_[0.0, np.diff(T_spo2)]
-
-    vE_hrv = np.r_[0.0, np.diff(E_hrv)]
-    vE_rr = np.r_[0.0, np.diff(E_rr)]
-    vE_spo2 = np.r_[0.0, np.diff(E_spo2)]
-
-    df = pd.DataFrame({
-        "min": np.arange(1, n+1),
-        "HRV": hrv, "RR": rr, "SpO2": spo2,
-        "%dHRV": d_hrv, "%dRR": d_rr, "%dSpO2": d_spo2,
-        "bad_HRV": bad_hrv, "bad_RR": bad_rr, "bad_SpO2": bad_spo2,
-        "active_systems": active,
-        "dn_step(mean_active,gated)": dn_step,
-        "dn_worst(window)": dn_worst,
-        "dn_ewma(drift)": dn_ewma,
-        "DN_final": dn_final,
-        "label": labels,
-        "shock": shock,
-        "T_hrv": T_hrv, "T_rr": T_rr, "T_spo2": T_spo2,
-        "E_hrv": E_hrv, "E_rr": E_rr, "E_spo2": E_spo2,
-        "vT_hrv": vT_hrv, "vT_rr": vT_rr, "vT_spo2": vT_spo2,
-        "vE_hrv": vE_hrv, "vE_rr": vE_rr, "vE_spo2": vE_spo2,
-    })
-
-    return dn_step, dn_worst, dn_ewma, dn_final, labels, red_minutes, warn_minutes, shock_minutes, df
-
-def build_dn_plot(dn_final, labels, thr_warn, thr_red, title="DN dynamic (parallel: drift + worst)"):
-    n = len(dn_final)
-    x = np.arange(1, n+1)
-
-    # marker colors
-    colors = []
-    for lb in labels:
-        if lb == "RED":
-            colors.append("#d62728")
-        elif lb == "WARNING":
-            colors.append("#ff7f0e")
-        else:
-            colors.append("#2ca02c")
+# ----------------------------
+# Plotting
+# ----------------------------
+def plot_dn(df, upto):
+    d = df.iloc[:upto].copy()
+    x = d["minute"].to_list()
+    y = d["DN_level"].to_list()
+    colors = [color_map(s) for s in d["DN_status"].to_list()]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=x, y=dn_final,
+        x=x, y=y,
         mode="lines+markers",
-        marker=dict(size=9, color=colors),
-        line=dict(width=2),
+        line=dict(width=3),
+        marker=dict(size=10, color=colors, line=dict(width=1, color="#111111")),
         name="DN"
     ))
-
-    # Threshold lines
-    fig.add_hline(y=thr_red, line_dash="dash", opacity=0.5)
-    fig.add_hline(y=thr_warn, line_dash="dash", opacity=0.5)
-
     fig.update_layout(
-        title=title,
-        xaxis_title="Time (minute index)",
-        yaxis_title="DN (0..1)",
-        yaxis=dict(range=[0, 1.0]),
         height=430,
-        margin=dict(l=40, r=20, t=55, b=40)
+        margin=dict(l=40, r=20, t=40, b=40),
+        xaxis_title="Minute",
+        yaxis_title="DN (GREEN=0, WARNING=1, RED=2)",
+        yaxis=dict(range=[-0.2, 2.2], dtick=1),
     )
     fig.update_xaxes(dtick=1)
     return fig
 
-# -------------------------
-# UI
-# -------------------------
-st.title("DN alert demo")
-st.caption("DN_dynamic (baseline-free): parallel signals = SHOCK step + DRIFT (EWMA) + Worst-in-window. Designed for low false alarms.")
+def plot_raw(df, upto):
+    d = df.iloc[:upto].copy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=d["minute"], y=d["HRV"], mode="lines+markers", name="HRV"))
+    fig.add_trace(go.Scatter(x=d["minute"], y=d["RR"], mode="lines+markers", name="RR"))
+    fig.add_trace(go.Scatter(x=d["minute"], y=d["SpO2"], mode="lines+markers", name="SpO2"))
+    fig.update_layout(
+        height=430,
+        margin=dict(l=40, r=20, t=40, b=40),
+        xaxis_title="Minute",
+        yaxis_title="Raw values",
+    )
+    fig.update_xaxes(dtick=1)
+    return fig
 
-colL, colR = st.columns([1, 1.2], gap="large")
+# ----------------------------
+# UI Layout
+# ----------------------------
+left, right = st.columns([1, 1.25], gap="large")
 
-with colL:
-    st.subheader("Input (15 points each)")
-    default_hrv = "45 44 42 35 36 32 30 31 32 35 38 40 42 43 45"
-    default_rr = "14 14 15 15 16 16 17 18 19 16 17 18 19 20 21"
-    default_spo2 = "98 97 92 97 95 94 94 92 93 94 95 96 97 98 99"
+with left:
+    st.subheader("Input (15 points)")
+    default_hrv = "45 44 42 35 36 32 30 28 27 22 24 23 21 20 19"
+    default_rr = "14 14 15 15 16 16 17 18 19 20 21 22 23 24 25"
+    default_spo2 = "98 97 92 97 95 94 94 92 93 89 90 91 90 89 89"
 
-    hrv_txt = st.text_area("HRV (ms)", value=default_hrv, height=80)
-    rr_txt = st.text_area("RR (breaths/min)", value=default_rr, height=80)
-    spo2_txt = st.text_area("SpO₂ (%)", value=default_spo2, height=80)
+    hrv_txt = st.text_area("HRV (ms)", default_hrv, height=80)
+    rr_txt = st.text_area("RR (breaths/min)", default_rr, height=80)
+    spo2_txt = st.text_area("SpO₂ (%)", default_spo2, height=80)
 
-    with st.expander("Settings (hidden by default)", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            w = st.selectbox("Worst-in-window (minutes)", [3, 5], index=0)
-            alpha = st.slider("EWMA alpha (drift smoothing)", 0.50, 0.90, 0.75, 0.05)
-            min_sys = st.selectbox("Min active systems (anti false alarm)", [1, 2, 3], index=1)
-        with c2:
-            thr_warn = st.slider("WARNING threshold (DN)", 0.10, 0.40, 0.22, 0.01)
-            thr_red = st.slider("RED threshold (DN)", 0.20, 0.70, 0.35, 0.01)
-            shock_thr = st.slider("SHOCK threshold (max badness)", 0.20, 0.80, 0.35, 0.01)
+    cA, cB = st.columns(2)
+    with cA:
+        static_btn = st.button("Run static", use_container_width=True)
+    with cB:
+        play_btn = st.button("Play (3s/step)", use_container_width=True)
 
-        st.markdown("**Normalization constants (fixed DN cores):**")
-        K_hrv = st.number_input("K_hrv", value=80.0, step=1.0)
-        K_rr = st.number_input("K_rr", value=25.0, step=1.0)
-        K_spo2 = st.number_input("K_spo2", value=5.0, step=0.5)
+    st.markdown("**Note:** App only updates when you press a button (no auto-run on edit).")
 
-    run_static = st.button("Run static", use_container_width=True)
-    play = st.button("Play (3s/step)", use_container_width=True)
-    stop = st.button("Stop", use_container_width=True)
-
-with colR:
-    st.subheader("Output")
-
-# Playback state
+# session state
+if "computed_df" not in st.session_state:
+    st.session_state.computed_df = None
 if "playing" not in st.session_state:
     st.session_state.playing = False
-if "play_idx" not in st.session_state:
-    st.session_state.play_idx = 1
 
-if stop:
-    st.session_state.playing = False
-    st.session_state.play_idx = 1
+# Build DF only on button click
+def compute_df(hrv, rr, spo2):
+    n = 15
+    rows = []
+    for i in range(n):
+        # HRV
+        h_label, d_hrv, T_hrv, E_hrv = hrv_label(hrv, i)
 
-# Parse inputs
-hrv = parse_series(hrv_txt)
-rr = parse_series(rr_txt)
-spo2 = parse_series(spo2_txt)
+        # RR
+        if i == 0:
+            r_label, T_rr = "GREEN", 0.0
+            d_rr = 0.0
+        else:
+            r_label, T_rr = rr_label(rr[i-1], rr[i])
+            d_rr = pct_change(rr[i-1], rr[i])
 
-ok = (len(hrv) == len(rr) == len(spo2) == 15)
+        # SpO2
+        if i == 0:
+            s_label, T_sp = "GREEN", 0.0
+            d_sp = 0.0
+        else:
+            next_val = spo2[i+1] if i + 1 < n else None
+            s_label, T_sp = spo2_label(spo2[i-1], spo2[i], next_val=next_val)
+            d_sp = spo2[i] - spo2[i-1]
 
-if not ok:
-    with colR:
-        st.error("Bạn phải nhập đúng **15 số** cho mỗi dãy (HRV, RR, SpO₂).")
-    st.stop()
+        dn = dn_gatekeeper(h_label, r_label, s_label)
 
-# Compute DN for full series once
-dn_step, dn_worst, dn_ewma, dn_final, labels, red_minutes, warn_minutes, shock_minutes, df = compute_dn_dynamic(
-    hrv, rr, spo2,
-    K_hrv=K_hrv, K_rr=K_rr, K_spo2=K_spo2,
-    w=w, alpha=alpha,
-    thr_warn=thr_warn, thr_red=thr_red,
-    shock_thr=shock_thr,
-    min_systems_for_alert=min_sys
-)
+        dn_level = 0
+        if dn == "WARNING":
+            dn_level = 1
+        elif dn == "RED":
+            dn_level = 2
 
-def render(min_upto: int):
-    # slice to minute
-    dn_slice = dn_final[:min_upto]
-    labels_slice = labels[:min_upto]
+        rows.append({
+            "minute": i + 1,
+            "HRV": hrv[i],
+            "RR": rr[i],
+            "SpO2": spo2[i],
+            "%dHRV": d_hrv if i > 0 else 0.0,
+            "%dRR": d_rr if i > 0 else 0.0,
+            "dSpO2": d_sp if i > 0 else 0.0,
+            "T_hrv": T_hrv,
+            "E_hrv": E_hrv,
+            "T_rr": T_rr,
+            "T_spo2": T_sp,
+            "HRV_status": h_label,
+            "RR_status": r_label,
+            "SpO2_status": s_label,
+            "DN_status": dn,
+            "DN_level": dn_level
+        })
+    return pd.DataFrame(rows)
 
-    # per-minute label text
-    red_m = [m for m in red_minutes if m <= min_upto]
-    warn_m = [m for m in warn_minutes if m <= min_upto]
-    shock_m = [m for m in shock_minutes if m <= min_upto]
+def validate_inputs(hrv, rr, spo2):
+    return len(hrv) == 15 and len(rr) == 15 and len(spo2) == 15
 
-    # Overall status at current minute
-    current_label = labels[min_upto - 1]
-    if current_label == "RED":
-        st.error(f"🔴 RED (minute {min_upto})")
-    elif current_label == "WARNING":
-        st.warning(f"🟠 WARNING (minute {min_upto})")
-    else:
-        st.success(f"🟢 STABLE (minute {min_upto})")
+# button actions
+hrv = parse_15(hrv_txt)
+rr = parse_15(rr_txt)
+spo2 = parse_15(spo2_txt)
 
-    st.markdown(
-        f"**RED minutes:** {red_m if red_m else 'None'}  \n"
-        f"**WARNING minutes:** {warn_m if warn_m else 'None'}  \n"
-        f"**SHOCK minutes (step events):** {shock_m if shock_m else 'None'}"
-    )
+if static_btn or play_btn:
+    if not validate_inputs(hrv, rr, spo2):
+        with right:
+            st.error("Bạn phải nhập đúng **15 số** cho mỗi dãy HRV / RR / SpO₂.")
+        st.stop()
+    st.session_state.computed_df = compute_df(hrv, rr, spo2)
 
-    fig = build_dn_plot(
-        dn_final, labels,
-        thr_warn=thr_warn, thr_red=thr_red,
-        title=f"DN dynamic — parallel (Worst-in-window={w}m, EWMA α={alpha:.2f})"
-    )
-    # show full plot but it's okay; minute focus is from labels list above
-    st.plotly_chart(fig, use_container_width=True)
+# Render output
+with right:
+    st.subheader("Output")
 
-    with st.expander("Details (per minute: %Δ, T/E, vT/vE, badness, DN parts)", expanded=False):
-        st.dataframe(df, use_container_width=True, height=320)
+    df = st.session_state.computed_df
+    if df is None:
+        st.info("Nhập 15 điểm cho mỗi chỉ số, rồi bấm **Run static** hoặc **Play**.")
+        st.stop()
 
-with colR:
-    placeholder = st.empty()
+    # Summary minutes
+    red_minutes = df.loc[df["DN_status"] == "RED", "minute"].tolist()
+    warn_minutes = df.loc[df["DN_status"] == "WARNING", "minute"].tolist()
 
-# Run static
-if run_static:
-    with colR:
-        placeholder.container()
+    st.write(f"**DN RED minutes:** {red_minutes if red_minutes else 'None'}")
+    st.write(f"**DN WARNING minutes:** {warn_minutes if warn_minutes else 'None'}")
+
+    ph1 = st.empty()
+    ph2 = st.empty()
+    ph3 = st.empty()
+
+    def render(upto):
+        ph1.plotly_chart(plot_dn(df, upto), use_container_width=True)
+        ph2.plotly_chart(plot_raw(df, upto), use_container_width=True)
+
+        with ph3.container():
+            st.markdown("### Table (per minute)")
+            st.dataframe(df.iloc[:upto], use_container_width=True, height=320)
+
+    # Static
+    if static_btn and not play_btn:
         render(15)
 
-# Play simulation (blocking loop but simplest & stable)
-if play:
-    st.session_state.playing = True
-    st.session_state.play_idx = 1
-
-if st.session_state.playing and not stop:
-    with colR:
-        for i in range(st.session_state.play_idx, 16):
-            placeholder.container()
-            render(i)
-            st.session_state.play_idx = i + 1
+    # Play
+    if play_btn:
+        for upto in range(1, 16):
+            render(upto)
             time.sleep(3)
-        st.session_state.playing = False
-        st.session_state.play_idx = 1
-
-# Default first view
-if (not run_static) and (not play) and (not st.session_state.playing):
-    with colR:
-        placeholder.container()
-        render(15)

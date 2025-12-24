@@ -3,20 +3,23 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-# =========================
-# DN DYNAMIC PARAMETERS (CHỐT)
-# =========================
-K_HRV = 80
-K_RR = 25
-K_SPO2 = 5
-N_POINTS = 30
-STEP_SECONDS = 3  # Play: 3 seconds per step
+# ====== CHỐT K ======
+K_HRV = 80      # for %ΔHRV (drop)
+K_RR  = 25      # for %ΔRR (rise)  (chốt như bạn)
+K_SPO2 = 5      # for SpO2 absolute drop (points)  (chốt k=5)
 
-# =========================
-# Helpers
-# =========================
+N_POINTS = 30
+STEP_SECONDS = 3
+
+# ====== CORE SETTINGS ======
+W = 6  # rolling window length (minutes) to capture "drift / sụp dần"
+# threshold for "this channel is active" in the rolling window
+THR_ACTIVE = 0.18
+# DN thresholds for color
+THR_AMBER = 0.28
+THR_RED   = 0.55
+
 def _rerun():
-    # Streamlit version compatibility
     if hasattr(st, "rerun"):
         st.rerun()
     else:
@@ -34,44 +37,66 @@ def pct_change(x):
             pct[i] = 100 * (x[i] - x[i - 1]) / x[i - 1]
     return pct
 
+def rolling_sum(arr, w):
+    out = np.zeros_like(arr, dtype=float)
+    for i in range(len(arr)):
+        s = max(0, i - w + 1)
+        out[i] = float(np.sum(arr[s:i+1]))
+    return out
+
 def dn_dynamic(hrv, rr, spo2):
     """
-    DN_dynamic (baseline-free):
-    - Compute |%Δ| for each signal
-    - Normalize by K: HRV/80, RR/25, SpO2/5
-    - Filter false alarms: activate only if >=2 systems exceed T>0.25
+    DN_dynamic ICU-friendly:
+    - HRV: only DROP matters -> max(0, -%ΔHRV)/K_HRV
+    - RR: only RISE matters -> max(0, +%ΔRR)/K_RR
+    - SpO2: absolute DROP in points -> max(0, prev-curr)/K_SPO2
+    - Rolling window sum (W) to capture drift/sụp dần
+    - False-alarm filter: activate only if >=2 systems active in window
     """
+
     hrv = np.array(hrv, dtype=float)
     rr = np.array(rr, dtype=float)
     spo2 = np.array(spo2, dtype=float)
 
-    T_hrv = np.abs(pct_change(hrv)) / K_HRV
-    T_rr = np.abs(pct_change(rr)) / K_RR
-    T_spo2 = np.abs(pct_change(spo2)) / K_SPO2
+    # step dynamics
+    pct_hrv = pct_change(hrv)
+    pct_rr  = pct_change(rr)
 
-    dn = np.zeros(len(hrv))
+    hrv_step = np.maximum(0.0, -pct_hrv) / K_HRV
+    rr_step  = np.maximum(0.0,  pct_rr)  / K_RR
+
+    spo2_step = np.zeros(len(spo2), dtype=float)
+    for i in range(1, len(spo2)):
+        drop = max(0.0, spo2[i-1] - spo2[i])  # absolute points
+        spo2_step[i] = drop / K_SPO2
+
+    # rolling window "drift" intensity
+    hrv_win = rolling_sum(hrv_step, W)
+    rr_win  = rolling_sum(rr_step,  W)
+    spo2_win = rolling_sum(spo2_step, W)
+
+    dn = np.zeros(len(hrv), dtype=float)
+
     for i in range(len(hrv)):
         active = sum([
-            T_hrv[i] > 0.25,
-            T_rr[i] > 0.25,
-            T_spo2[i] > 0.25
+            hrv_win[i]  >= THR_ACTIVE,
+            rr_win[i]   >= THR_ACTIVE,
+            spo2_win[i] >= THR_ACTIVE
         ])
-        dn[i] = max(T_hrv[i], T_rr[i], T_spo2[i]) if active >= 2 else 0.0
 
-    return dn
+        if active >= 2:
+            dn[i] = max(hrv_win[i], rr_win[i], spo2_win[i])
+        else:
+            dn[i] = 0.0  # filtered as likely noise/isolated artifact
+
+    return dn, hrv_step, rr_step, spo2_step, hrv_win, rr_win, spo2_win
 
 def dn_state(dn):
-    """
-    Demo thresholds (for visualization only):
-    - GREEN: < 0.35
-    - AMBER: 0.35–0.6
-    - RED: >= 0.6
-    """
     states = []
     for v in dn:
-        if v >= 0.6:
+        if v >= THR_RED:
             states.append("RED")
-        elif v >= 0.35:
+        elif v >= THR_AMBER:
             states.append("AMBER")
         else:
             states.append("GREEN")
@@ -79,53 +104,45 @@ def dn_state(dn):
 
 def render_status_box(state_now: str):
     if state_now == "RED":
-        st.error("🔴 PRE-FAILURE ALERT")
-        st.caption("Multi-system reserve acceleration detected (DN_dynamic).")
+        st.error("🔴 PRE-FAILURE ALERT (DN_dynamic)")
+        st.caption("Sustained multi-system drift detected (rolling window).")
     elif state_now == "AMBER":
-        st.warning("🟡 MONITOR CLOSELY")
-        st.caption("Reserve is accelerating—watch closely (DN_dynamic).")
+        st.warning("🟡 MONITOR CLOSELY (DN_dynamic)")
+        st.caption("Multi-system drift rising—watch trend.")
     else:
-        st.success("🟢 STABLE")
-        st.caption("No significant multi-system reserve acceleration detected.")
+        st.success("🟢 STABLE (DN_dynamic)")
+        st.caption("No sustained multi-system drift detected.")
 
 def dn_plot(dn, states, upto_idx):
-    # upto_idx is inclusive count of points to show (1..N_POINTS)
-    dn_show = dn[:upto_idx]
-    states_show = states[:upto_idx]
-
     color_map = {"GREEN": "#2ecc71", "AMBER": "#f1c40f", "RED": "#e74c3c"}
-    colors = [color_map[s] for s in states_show]
+    colors = [color_map[s] for s in states[:upto_idx]]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=list(range(1, upto_idx + 1)),
-        y=dn_show,
+        y=dn[:upto_idx],
         mode="lines+markers",
         marker=dict(color=colors, size=9),
         line=dict(color="gray", width=2)
     ))
-
-    # reference lines (optional but helpful)
-    fig.add_hline(y=0.35, line_dash="dot", line_color="gray")
-    fig.add_hline(y=0.6, line_dash="dot", line_color="gray")
-
+    fig.add_hline(y=THR_AMBER, line_dash="dot", line_color="gray")
+    fig.add_hline(y=THR_RED, line_dash="dot", line_color="gray")
     fig.update_layout(
         height=380,
         margin=dict(l=20, r=20, t=30, b=20),
         xaxis_title="Time (minute index)",
-        yaxis_title="DN_dynamic intensity",
+        yaxis_title=f"DN_dynamic (rolling W={W})",
         showlegend=False
     )
     return fig
 
 # =========================
-# Streamlit UI
+# UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("DN Prognostic Signal Demo")
-st.caption("DN_dynamic (baseline-free) · HRV · RR · SpO₂ · false-alarm filtering (≥2 systems)")
+st.title("DN Dynamic ICU Demo (HRV · RR · SpO₂)")
+st.caption("Baseline-free + rolling drift + false-alarm filtering (≥2 systems)")
 
-# session state init
 if "playing" not in st.session_state:
     st.session_state.playing = False
 if "play_idx" not in st.session_state:
@@ -160,30 +177,13 @@ with left:
     with c3:
         stop_btn = st.button("Stop")
 
-    st.divider()
-    st.caption(f"Chốt K: HRV={K_HRV}, RR={K_RR}, SpO₂={K_SPO2}.  |  Input: {N_POINTS} points.  |  Play: {STEP_SECONDS}s/step")
+    st.caption(f"K: HRV={K_HRV}, RR={K_RR}, SpO₂={K_SPO2} | Rolling W={W} | Need ≥2 systems | Input={N_POINTS} points")
 
-# Parse + validate once (used by both modes)
-try:
-    hrv_all = parse_series(hrv_txt)
-    rr_all = parse_series(rr_txt)
-    spo2_all = parse_series(spo2_txt)
-except Exception:
-    hrv_all, rr_all, spo2_all = None, None, None
-
-def validate_and_trim():
-    if hrv_all is None or rr_all is None or spo2_all is None:
-        return None, None, None, "Input format error: please use numbers separated by spaces."
-
+def validate_and_trim(hrv_all, rr_all, spo2_all):
     if len(hrv_all) < N_POINTS or len(rr_all) < N_POINTS or len(spo2_all) < N_POINTS:
         return None, None, None, "Please provide at least 30 values for EACH signal."
+    return hrv_all[:N_POINTS], rr_all[:N_POINTS], spo2_all[:N_POINTS], None
 
-    hrv = hrv_all[:N_POINTS]
-    rr = rr_all[:N_POINTS]
-    spo2 = spo2_all[:N_POINTS]
-    return hrv, rr, spo2, None
-
-# Control buttons
 if stop_btn:
     st.session_state.playing = False
     st.session_state.play_idx = 1
@@ -192,43 +192,39 @@ if play_btn:
     st.session_state.playing = True
     st.session_state.play_idx = 1
 
-# Right side rendering
 with right:
-    # placeholders so UI doesn't jump
     status_box = st.container()
     chart_box = st.empty()
 
-    hrv, rr, spo2, err = validate_and_trim()
+    try:
+        hrv_all = parse_series(hrv_txt)
+        rr_all = parse_series(rr_txt)
+        spo2_all = parse_series(spo2_txt)
+        hrv, rr, spo2, err = validate_and_trim(hrv_all, rr_all, spo2_all)
+    except Exception:
+        err = "Input format error: please use numbers separated by spaces."
+        hrv = rr = spo2 = None
 
     if err:
         st.error(err)
-
     else:
-        dn = dn_dynamic(hrv, rr, spo2)
+        dn, hrv_step, rr_step, spo2_step, hrv_win, rr_win, spo2_win = dn_dynamic(hrv, rr, spo2)
         states = dn_state(dn)
 
-        # STATIC MODE
         if static_btn and not st.session_state.playing:
-            state_now = states[-1]
             with status_box:
-                render_status_box(state_now)
+                render_status_box(states[-1])
+            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=N_POINTS), use_container_width=True)
 
-            fig = dn_plot(dn, states, upto_idx=N_POINTS)
-            chart_box.plotly_chart(fig, use_container_width=True)
-
-        # PLAY MODE (pseudo-streaming)
         elif st.session_state.playing:
             idx = int(st.session_state.play_idx)
             idx = max(1, min(idx, N_POINTS))
 
-            state_now = states[idx - 1]
             with status_box:
-                render_status_box(state_now)
+                render_status_box(states[idx - 1])
 
-            fig = dn_plot(dn, states, upto_idx=idx)
-            chart_box.plotly_chart(fig, use_container_width=True)
+            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=idx), use_container_width=True)
 
-            # advance
             if idx >= N_POINTS:
                 st.session_state.playing = False
                 st.session_state.play_idx = 1
@@ -237,9 +233,6 @@ with right:
                 st.session_state.play_idx = idx + 1
                 _rerun()
 
-        # DEFAULT VIEW (when nothing pressed yet)
         else:
-            st.info("Press **Run static analysis** (final view) or **Play simulation (3s)** (streaming view).")
-            # show an empty/initial chart with first point for orientation
-            fig = dn_plot(dn, states, upto_idx=1)
-            chart_box.plotly_chart(fig, use_container_width=True)
+            st.info("Press **Run static analysis** or **Play simulation (3s)**.")
+            chart_box.plotly_chart(dn_plot(dn, states, upto_idx=1), use_container_width=True)
